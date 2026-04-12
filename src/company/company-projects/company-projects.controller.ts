@@ -1078,6 +1078,7 @@ export class CompanyProjectsController {
 
   /**
    * Admin: form defaults + saved PO fields (after WO approved, before project code).
+   * Includes wo_status and wo_remarks from the latest work order (e.g. rejection reason).
    * GET /api/company/projects/:projectId/admin/work-order-po
    */
   @Get(':projectId/admin/work-order-po')
@@ -2125,6 +2126,23 @@ export class CompanyProjectsController {
       req.user.userId,
       projectId,
       file,
+    );
+  }
+
+  /**
+   * Work order review remarks/status only (no document URL). Placed before work-order-document so
+   * GET .../work-order-document/remarks is not swallowed by the shorter route.
+   * GET /api/company/projects/:projectId/work-order-document/remarks
+   */
+  @Get(':projectId/work-order-document/remarks')
+  @UseGuards(JwtAuthGuard, AccountStatusGuard)
+  async getWorkOrderDocumentRemarks(
+    @Request() req,
+    @Param('projectId') projectId: string,
+  ): Promise<any> {
+    return this.companyProjectsService.getWorkOrderDocumentRemarks(
+      req.user.userId,
+      projectId,
     );
   }
 

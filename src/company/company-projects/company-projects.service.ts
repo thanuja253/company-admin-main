@@ -1186,6 +1186,7 @@ export class CompanyProjectsService {
     };
     const suggested = wo && (wo as any).createdAt ? ymd((wo as any).createdAt) : null;
     const savedDate = (project as any).work_order_po_acceptance_date;
+    const woStatus = wo != null ? Number((wo as any).wo_status) : null;
     return {
       status: 'success',
       message: 'Work order PO form data',
@@ -1194,8 +1195,10 @@ export class CompanyProjectsService {
         acceptance_date: savedDate ? ymd(savedDate) : null,
         suggested_acceptance_date: suggested,
         work_order_submitted_at: submitted,
-        work_order_approved: !!(wo && Number((wo as any).wo_status) === 1),
+        work_order_approved: !!(wo && woStatus === 1),
         project_code_assigned: !!String((project as any).project_id || '').trim(),
+        wo_status: wo != null && !Number.isNaN(woStatus) ? woStatus : null,
+        wo_remarks: (wo as any)?.wo_remarks ?? null,
       },
     };
   }
@@ -4558,6 +4561,63 @@ export class CompanyProjectsService {
           : (workOrder as any).updatedAt
             ? new Date((workOrder as any).updatedAt).toISOString()
             : null,
+      },
+    };
+  }
+
+  /**
+   * Latest work order review remarks/status only (no file URL). For separate UI loading/caching.
+   */
+  async getWorkOrderDocumentRemarks(companyId: string, projectId: string) {
+    const project = await this.projectModel.findOne({
+      _id: projectId,
+      company_id: companyId,
+    });
+
+    if (!project) {
+      throw new NotFoundException({
+        status: 'error',
+        message: 'Project not found',
+      });
+    }
+
+    const workOrder = await this.companyWorkOrderModel
+      .findOne({
+        company_id: companyId,
+        project_id: projectId,
+      })
+      .sort({ createdAt: -1 })
+      .lean();
+
+    if (!workOrder) {
+      return {
+        status: 'success',
+        message: 'No work order record for this project',
+        data: {
+          has_document: false,
+          wo_status: null,
+          wo_remarks: null,
+          wo_doc_status_updated_at: null,
+        },
+      };
+    }
+
+    const hasDoc = !!(workOrder as any).wo_doc;
+    const woStatus = (workOrder as any).wo_status;
+    const updatedAt = (workOrder as any).wo_doc_status_updated_at
+      ? new Date((workOrder as any).wo_doc_status_updated_at).toISOString()
+      : (workOrder as any).updatedAt
+        ? new Date((workOrder as any).updatedAt).toISOString()
+        : null;
+
+    return {
+      status: 'success',
+      message: 'Work order remarks retrieved successfully',
+      data: {
+        has_document: hasDoc,
+        wo_status: woStatus ?? null,
+        wo_remarks: (workOrder as any).wo_remarks || null,
+        wo_doc_status_updated_at: updatedAt,
       },
     };
   }
