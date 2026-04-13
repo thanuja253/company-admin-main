@@ -35,6 +35,7 @@ import { AssignCoordinatorDto } from './dto/assign-coordinator.dto';
 import { AssignAssessorDto } from './dto/assign-assessor.dto';
 import { AssignFacilitatorDto } from './dto/assign-facilitator.dto';
 import { SubmitPaymentDto } from './dto/submit-payment.dto';
+import { SubmitFinancePaymentDto } from './dto/submit-finance-payment.dto';
 import { UpdateInvoiceApprovalDto } from './dto/update-invoice-approval.dto';
 import { UploadLaunchAndTrainingDto } from './dto/upload-launch-and-training.dto';
 import { AddLaunchTrainingSessionDto } from './dto/add-launch-training-session.dto';
@@ -1924,6 +1925,26 @@ export class CompanyProjectsController {
   }
 
   /**
+   * Finance (new): get payment status/details.
+   * GET /api/company/projects/:projectId/finance/payments?payment_for=per_inv|inv
+   */
+  @Get(':projectId/finance/payments')
+  @UseGuards(JwtAuthGuard, AccountStatusGuard)
+  async getFinancePayments(
+    @Request() req,
+    @Param('projectId') projectId: string,
+    @Query('payment_for') paymentFor?: 'per_inv' | 'inv',
+  ): Promise<any> {
+    const normalized =
+      paymentFor === 'per_inv' || paymentFor === 'inv' ? paymentFor : undefined;
+    return this.companyProjectsService.getFinancePayments(
+      req.user.userId,
+      projectId,
+      normalized,
+    );
+  }
+
+  /**
    * Finance: CII uploads PI (Proforma Invoice) or Tax Invoice — next step after Assign Project Co-Ordinator / Resource Center.
    * POST /api/company/projects/:projectId/invoices/upload
    * Form: payment_for = 'per_inv' | 'inv', file = invoice_document (PDF, etc.)
@@ -2039,6 +2060,238 @@ export class CompanyProjectsController {
       invoiceId,
       dto,
       file,
+    );
+  }
+
+  /**
+   * Finance v2 compatibility: submit payment for Proforma invoice.
+   * POST /api/company/projects/:projectId/finance/v2/proforma-invoices/:invoiceId/submit-payment
+   */
+  @Post(':projectId/finance/v2/proforma-invoices/:invoiceId/submit-payment')
+  @UseGuards(JwtAuthGuard, AccountStatusGuard)
+  @UsePipes(new ValidationPipe({ transform: true, whitelist: true }))
+  @UseInterceptors(
+    FileFieldsInterceptor(
+      [
+        { name: 'supporting_document', maxCount: 1 },
+        { name: 'supportingdocument', maxCount: 1 },
+        { name: 'supportingDocument', maxCount: 1 },
+        { name: 'supporting_doc', maxCount: 1 },
+      ],
+      {
+        storage: diskStorage({
+          destination: (req, file, cb) => {
+            const companyId = (req as any).user?.userId;
+            const uploadPath = join(process.cwd(), 'uploads', 'company', companyId || 'unknown');
+            if (!fs.existsSync(uploadPath)) {
+              fs.mkdirSync(uploadPath, { recursive: true });
+            }
+            cb(null, uploadPath);
+          },
+          filename: (req, file, cb) => {
+            const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1e9);
+            const ext = extname(file.originalname);
+            cb(null, `payment-${uniqueSuffix}${ext}`);
+          },
+        }),
+        limits: { fileSize: 10 * 1024 * 1024 },
+        fileFilter: (req, file, cb) => {
+          const allowed = [
+            'application/pdf',
+            'image/jpeg',
+            'image/jpg',
+            'image/png',
+          ];
+          if (allowed.includes(file.mimetype)) {
+            cb(null, true);
+          } else {
+            cb(new Error('Supporting document must be PDF, JPG, JPEG or PNG.'), false);
+          }
+        },
+      },
+    ),
+  )
+  async submitPaymentFinanceV2Proforma(
+    @Request() req,
+    @Param('projectId') projectId: string,
+    @Param('invoiceId') invoiceId: string,
+    @Body() body: any,
+    @UploadedFiles()
+    files: {
+      supporting_document?: Express.Multer.File[];
+      supportingdocument?: Express.Multer.File[];
+      supportingDocument?: Express.Multer.File[];
+      supporting_doc?: Express.Multer.File[];
+    },
+  ): Promise<any> {
+    const supportingDoc =
+      files?.supporting_document?.[0] ??
+      files?.supportingdocument?.[0] ??
+      files?.supportingDocument?.[0] ??
+      files?.supporting_doc?.[0];
+    const dto: SubmitPaymentDto = {
+      payment_type: body?.payment_type,
+      trans_id: body?.trans_id,
+    };
+    return this.companyProjectsService.submitPayment(
+      req.user.userId,
+      projectId,
+      invoiceId,
+      dto,
+      supportingDoc,
+    );
+  }
+
+  /**
+   * Finance v2 compatibility: submit payment for Tax invoice.
+   * POST /api/company/projects/:projectId/finance/v2/tax-invoices/:invoiceId/submit-payment
+   */
+  @Post(':projectId/finance/v2/tax-invoices/:invoiceId/submit-payment')
+  @UseGuards(JwtAuthGuard, AccountStatusGuard)
+  @UsePipes(new ValidationPipe({ transform: true, whitelist: true }))
+  @UseInterceptors(
+    FileFieldsInterceptor(
+      [
+        { name: 'supporting_document', maxCount: 1 },
+        { name: 'supportingdocument', maxCount: 1 },
+        { name: 'supportingDocument', maxCount: 1 },
+        { name: 'supporting_doc', maxCount: 1 },
+      ],
+      {
+        storage: diskStorage({
+          destination: (req, file, cb) => {
+            const companyId = (req as any).user?.userId;
+            const uploadPath = join(process.cwd(), 'uploads', 'company', companyId || 'unknown');
+            if (!fs.existsSync(uploadPath)) {
+              fs.mkdirSync(uploadPath, { recursive: true });
+            }
+            cb(null, uploadPath);
+          },
+          filename: (req, file, cb) => {
+            const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1e9);
+            const ext = extname(file.originalname);
+            cb(null, `payment-${uniqueSuffix}${ext}`);
+          },
+        }),
+        limits: { fileSize: 10 * 1024 * 1024 },
+        fileFilter: (req, file, cb) => {
+          const allowed = [
+            'application/pdf',
+            'image/jpeg',
+            'image/jpg',
+            'image/png',
+          ];
+          if (allowed.includes(file.mimetype)) {
+            cb(null, true);
+          } else {
+            cb(new Error('Supporting document must be PDF, JPG, JPEG or PNG.'), false);
+          }
+        },
+      },
+    ),
+  )
+  async submitPaymentFinanceV2Tax(
+    @Request() req,
+    @Param('projectId') projectId: string,
+    @Param('invoiceId') invoiceId: string,
+    @Body() body: any,
+    @UploadedFiles()
+    files: {
+      supporting_document?: Express.Multer.File[];
+      supportingdocument?: Express.Multer.File[];
+      supportingDocument?: Express.Multer.File[];
+      supporting_doc?: Express.Multer.File[];
+    },
+  ): Promise<any> {
+    const supportingDoc =
+      files?.supporting_document?.[0] ??
+      files?.supportingdocument?.[0] ??
+      files?.supportingDocument?.[0] ??
+      files?.supporting_doc?.[0];
+    const dto: SubmitPaymentDto = {
+      payment_type: body?.payment_type,
+      trans_id: body?.trans_id,
+    };
+    return this.companyProjectsService.submitPayment(
+      req.user.userId,
+      projectId,
+      invoiceId,
+      dto,
+      supportingDoc,
+    );
+  }
+
+  /**
+   * Finance (new): submit payment without invoiceId in URL.
+   * POST /api/company/projects/:projectId/finance/payments/submit
+   * Form: payment_for, payment_type, trans_id?, supporting_document (or supportingdocument)
+   */
+  @Post(':projectId/finance/payments/submit')
+  @UseGuards(JwtAuthGuard, AccountStatusGuard)
+  @UsePipes(new ValidationPipe({ transform: true, whitelist: true }))
+  @UseInterceptors(
+    FileFieldsInterceptor(
+      [
+        { name: 'supporting_document', maxCount: 1 },
+        { name: 'supportingdocument', maxCount: 1 },
+        { name: 'supportingDocument', maxCount: 1 },
+        { name: 'supporting_doc', maxCount: 1 },
+      ],
+      {
+        storage: diskStorage({
+          destination: (req, file, cb) => {
+            const companyId = (req as any).user?.userId;
+            const uploadPath = join(process.cwd(), 'uploads', 'company', companyId || 'unknown');
+            if (!fs.existsSync(uploadPath)) {
+              fs.mkdirSync(uploadPath, { recursive: true });
+            }
+            cb(null, uploadPath);
+          },
+          filename: (req, file, cb) => {
+            const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1e9);
+            const ext = extname(file.originalname);
+            cb(null, `payment-${uniqueSuffix}${ext}`);
+          },
+        }),
+        limits: { fileSize: 10 * 1024 * 1024 },
+        fileFilter: (req, file, cb) => {
+          const allowed = [
+            'application/pdf',
+            'image/jpeg',
+            'image/jpg',
+            'image/png',
+          ];
+          if (allowed.includes(file.mimetype)) {
+            cb(null, true);
+          } else {
+            cb(new Error('Supporting document must be PDF, JPG, JPEG or PNG.'), false);
+          }
+        },
+      },
+    ),
+  )
+  async submitFinancePayment(
+    @Request() req,
+    @Param('projectId') projectId: string,
+    @Body() dto: SubmitFinancePaymentDto,
+    @UploadedFiles()
+    files: {
+      supporting_document?: Express.Multer.File[];
+      supportingdocument?: Express.Multer.File[];
+      supportingDocument?: Express.Multer.File[];
+      supporting_doc?: Express.Multer.File[];
+    },
+  ): Promise<any> {
+    const supportingDoc =
+      files?.supporting_document?.[0] ??
+      files?.supportingdocument?.[0] ??
+      files?.supportingDocument?.[0] ??
+      files?.supporting_doc?.[0];
+    return this.companyProjectsService.submitFinancePayment(
+      req.user.userId,
+      projectId,
+      dto,
+      supportingDoc,
     );
   }
 

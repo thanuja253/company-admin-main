@@ -29,6 +29,7 @@ import {
 } from '../schemas/master-primary-data-checklist.schema';
 import { RegistrationInfoDto } from './dto/registration-info.dto';
 import { SubmitPaymentDto } from './dto/submit-payment.dto';
+import { SubmitFinancePaymentDto } from './dto/submit-finance-payment.dto';
 import { UpdateInvoiceApprovalDto } from './dto/update-invoice-approval.dto';
 import { UpdateQuickviewDataDto } from './dto/update-quickview-data.dto';
 import { WorkOrderPoDetailsDto } from './dto/work-order-po-details.dto';
@@ -1078,6 +1079,54 @@ export class CompanyProjectsService {
     return { companyId, resolvedProjectId, resolution };
   }
 
+  /**
+   * Finance pages sometimes pass company_id in URL (same pattern as quickview/admin pages).
+   * Resolve to an actual project _id owned by the authenticated company.
+   */
+  private async resolveProjectIdForCompanyFinance(
+    companyId: string,
+    projectIdOrCompanyId: string,
+  ): Promise<string> {
+    if (!Types.ObjectId.isValid(projectIdOrCompanyId)) {
+      throw new BadRequestException({
+        status: 'error',
+        message: 'Invalid project id',
+      });
+    }
+
+    const companyOid = new Types.ObjectId(String(companyId));
+    const routeIdOid = new Types.ObjectId(String(projectIdOrCompanyId));
+
+    const directProject = await this.projectModel
+      .findOne({
+        _id: routeIdOid,
+        $or: [{ company_id: String(companyId) }, { company_id: companyOid }],
+      })
+      .select('_id')
+      .lean();
+    if (directProject?._id) {
+      return String(directProject._id);
+    }
+
+    // Fallback only when frontend sent company_id in route.
+    if (String(projectIdOrCompanyId) === String(companyId)) {
+      const candidates = await this.projectModel
+        .find({
+          $or: [{ company_id: String(companyId) }, { company_id: companyOid }],
+        })
+        .select(
+          'company_id registration_info profile_update updatedAt createdAt launch_training_document launch_training_sessions next_activities_id project_id',
+        )
+        .lean();
+      const picked = pickBestProjectForRegistration(candidates as any[]);
+      if (picked?._id) {
+        return String((picked as any)._id);
+      }
+    }
+
+    throw new NotFoundException({ status: 'error', message: 'Project not found' });
+  }
+
   /** Latest work order row for a project (aligns with proposal-workorder WO query). */
   private async findLatestWorkOrderForProject(companyId: string, projectId: string) {
     const pOid = new Types.ObjectId(String(projectId));
@@ -1442,6 +1491,10 @@ export class CompanyProjectsService {
   async getQuickviewData(
     companyId: string,
     projectId: string,
+    quickviewOpts?: {
+      /** Same `data` object as GET …/launch-training-program (admin) / launch-and-training — keeps milestones in sync when project lean omits sessions. */
+      launchTrainingProgramPayload?: Record<string, unknown>;
+    },
   ): Promise<{
     status: 'success';
     message: string;
@@ -1492,6 +1545,7 @@ export class CompanyProjectsService {
       companyCoordinator,
       companyAssessors,
       launchTrainingResourceDoc,
+      proformaInvoiceWithDocument,
     ] = await Promise.all([
       this.companyModel.findById(companyId).lean(),
       this.companyActivityModel.find(activityScope).sort({ createdAt: -1 }).lean(),
@@ -1524,11 +1578,35 @@ export class CompanyProjectsService {
         .lean(),
       this.companyResourceDocumentModel
         .findOne({
-          project_id: projectOidForWo,
-          is_active: true,
-          document_type: 'launch_training',
+          $and: [
+            {
+              $or: [
+                { project_id: projectOidForWo },
+                { project_id: String(projectId) },
+                { project_id: pid },
+              ],
+            },
+            { is_active: true },
+            { document_type: 'launch_training' },
+          ],
         })
         .sort({ createdAt: -1 })
+        .lean(),
+      this.companyInvoiceModel
+        .findOne({
+          $and: [
+            {
+              $or: [
+                { project_id: projectOidForWo },
+                { project_id: String(projectId) },
+                { project_id: pid },
+              ],
+            },
+            { payment_for: PAYMENT_FOR_PROFORMA },
+            { invoice_document: { $exists: true, $nin: [null, ''] } },
+          ],
+        })
+        .sort({ updatedAt: -1 })
         .lean(),
     ]);
 
@@ -1593,15 +1671,16 @@ export class CompanyProjectsService {
       ) {
         return 1;
       }
-      // Launch & Training rows use milestone_flow 63 — not a main-flow step (7 is Assign Coordinator).
-      // Return null so pipeline "latest completed" stays on real steps and activity rows are not mislabeled as step 7.
+      // Launch & Training: legacy DB used 63; quickview uses a dedicated id so logs + strip can show it
+      // without inflating the main 1–24 pipeline (see latestCompleted math below).
       const launchTrainingUpload =
         Number(rawFlow) === 63 ||
+        Number(rawFlow) === CompanyProjectsService.LAUNCH_TRAINING_MILESTONE_FLOW ||
         (description.includes('launch') &&
           description.includes('training') &&
           (description.includes('uploaded') || description.includes('document')));
       if (launchTrainingUpload) {
-        return null;
+        return CompanyProjectsService.LAUNCH_TRAINING_MILESTONE_FLOW;
       }
 
       return Number.isFinite(rawFlow as number) ? rawFlow : null;
@@ -1611,9 +1690,16 @@ export class CompanyProjectsService {
     const activityCountsTowardCompletedPipeline = (a: any): boolean => {
       if (!a.milestone_completed) return false;
       const f = normalizeMilestoneFlow(a);
+      if (f === CompanyProjectsService.LAUNCH_TRAINING_MILESTONE_FLOW) return true;
       if (f == null || f < 1) return false;
       if (f === 3 && !hasProposalDocument) return false;
       return true;
+    };
+
+    const mainFlowNumberForPipeline = (a: any): number => {
+      const f = normalizeMilestoneFlow(a);
+      if (f === CompanyProjectsService.LAUNCH_TRAINING_MILESTONE_FLOW) return 0;
+      return Number.isFinite(f as number) ? (f as number) : 0;
     };
 
     // Latest completed = highest milestone_flow among qualifying completed activities (not "first by date")
@@ -1623,7 +1709,7 @@ export class CompanyProjectsService {
     );
     let latestCompletedMilestoneNumberFromActivities =
       completedMilestones.length > 0
-        ? Math.max(...completedMilestones.map((a: any) => normalizeMilestoneFlow(a) || 0))
+        ? Math.max(...completedMilestones.map((a: any) => mainFlowNumberForPipeline(a)))
         : 0;
     // Strict onboarding guard: without proposal document, project cannot be beyond step 2.
     if (!hasProposalDocument) {
@@ -1705,9 +1791,9 @@ export class CompanyProjectsService {
       6: { name: 'CII to provide Project Code', responsibility: 'CII' },
       7: { name: 'Assign Project Co‑Ordinator', responsibility: 'CII' },
       8: { name: 'CII uploaded the PI/Tax Invoice', responsibility: 'CII' },
-      9: { name: 'Company Paid Proforma Invoice', responsibility: 'Company' },
-      10: { name: 'CII Acknowledged Proforma Invoice', responsibility: 'CII' },
-      11: { name: 'Company Uploaded All Primary Data', responsibility: 'Company' },
+      9: { name: 'Company Will Make Payment', responsibility: 'Company' },
+      10: { name: 'CII will Acknowlement Proforma Invoice', responsibility: 'CII' },
+      11: { name: 'Need to Upload Primary Data Form', responsibility: 'Company' },
       12: { name: 'CII Approved All Primary Data', responsibility: 'CII' },
       13: { name: 'All Checklist / Assessment Documents Uploaded by Company', responsibility: 'Company' },
       14: { name: 'CII Approved All Assessment Submittal', responsibility: 'CII' },
@@ -1724,6 +1810,11 @@ export class CompanyProjectsService {
     };
 
     const workflowMilestoneCards = extendWorkflowCardsFromMilestoneSteps(milestoneSteps);
+    /** Between coordinator (7) and PI (8); not passed into workflow cards so step 24’s “next” stays correct. */
+    milestoneSteps[CompanyProjectsService.LAUNCH_TRAINING_MILESTONE_FLOW] = {
+      name: 'Launch & Training (Site Visit Report)',
+      responsibility: 'Admin',
+    };
 
     // Dedupe identical log rows (same flow + completion + description) so activity list matches timeline truth
     const seenActivityKeys = new Set<string>();
@@ -1744,7 +1835,7 @@ export class CompanyProjectsService {
     );
 
     // Get all company activities – same step names and responsibility as Latest/Next Step
-    const activitiesData = activitiesChronological
+    const activitiesDataFromDb = activitiesChronological
       .map((activity) => {
         const flow = normalizeMilestoneFlow(activity);
         const step = flow != null ? milestoneSteps[flow] : null;
@@ -1974,7 +2065,12 @@ export class CompanyProjectsService {
         d.includes('launch') &&
         d.includes('training') &&
         (d.includes('uploaded') || d.includes('document'));
-      return Number(a?.milestone_flow) === 63 || descMatch;
+      const mf = Number(a?.milestone_flow);
+      return (
+        mf === 63 ||
+        mf === CompanyProjectsService.LAUNCH_TRAINING_MILESTONE_FLOW ||
+        descMatch
+      );
     });
     const launchTrainingFromResourceDoc = !!(
       launchTrainingResourceDoc &&
@@ -1993,10 +2089,100 @@ export class CompanyProjectsService {
         ltProgramSnapshot.legacy_single?.document_url &&
         String(ltProgramSnapshot.legacy_single.document_url).trim()
       );
+    /** Same signals as headline / strip; was missing here so L&T could stay “in progress” despite uploads. */
+    const launchTrainingDoneFromProjectSignals =
+      this.projectLaunchTrainingSessionsIndicateUpload(project as any) ||
+      !!String((project as any).launch_training_document || '').trim();
+    /**
+     * Coordinator assignment sets `next_activities_id` to 8 before L&T is uploaded, so the pointer alone
+     * cannot mean L&T is done. If PI was uploaded, the service enforces L&T first — so a stored PI doc or
+     * logged milestone 8 proves the L&T gate was satisfied (including legacy rows missing session paths).
+     */
+    const launchTrainingDoneByPiEvidence =
+      !!(proformaInvoiceWithDocument &&
+        String((proformaInvoiceWithDocument as any).invoice_document || '').trim()) ||
+      (allActivities as any[]).some((a) => {
+        if (!a?.milestone_completed) return false;
+        if (Number(a?.milestone_flow) === 8) return true;
+        const d = String(a?.description || '').toLowerCase();
+        return (
+          (d.includes('proforma') && d.includes('invoice') && d.includes('upload')) ||
+          (d.includes('tax invoice') && d.includes('upload'))
+        );
+      });
+    const ltPayload = quickviewOpts?.launchTrainingProgramPayload;
+    const launchTrainingDoneFromProgramPayload =
+      !!ltPayload &&
+      ((Number((ltPayload as any).sessions_count) || 0) > 0 ||
+        (Array.isArray((ltPayload as any).sessions) &&
+          (ltPayload as any).sessions.some(
+            (s: any) => s && String(s?.document_url || s?.document_path || '').trim(),
+          )) ||
+        !!(
+          (ltPayload as any).legacy_single?.document_url &&
+          String((ltPayload as any).legacy_single.document_url).trim()
+        ));
+    /** If quickview has already advanced to PI/Tax invoice or beyond, treat L&T as completed in the strip/log. */
+    const launchTrainingDoneByNextStepFlow =
+      hasCoordinatorAssigned &&
+      nextMilestoneNumber >= 8 &&
+      nextStepDisplayName !== 'Launch & Training (Site Visit Report)';
     const launchTrainingDone =
       launchTrainingDoneFromLaunchTrainingGet ||
       launchTrainingActivityDone ||
-      launchTrainingFromResourceDoc;
+      launchTrainingFromResourceDoc ||
+      launchTrainingDoneFromProjectSignals ||
+      launchTrainingDoneByPiEvidence ||
+      launchTrainingDoneFromProgramPayload ||
+      launchTrainingDoneByNextStepFlow;
+
+    const hasLaunchTrainingActivityInDb = (allActivities as any[]).some((a) => {
+      if (!a?.milestone_completed) return false;
+      const mf = Number(a?.milestone_flow);
+      if (mf === 63 || mf === CompanyProjectsService.LAUNCH_TRAINING_MILESTONE_FLOW) return true;
+      const d = String(a?.description || '').toLowerCase();
+      return (
+        d.includes('launch') &&
+        d.includes('training') &&
+        (d.includes('uploaded') || d.includes('document') || d.includes('completed'))
+      );
+    });
+    const ltFlowId = CompanyProjectsService.LAUNCH_TRAINING_MILESTONE_FLOW;
+    const ltStepDef = milestoneSteps[ltFlowId];
+    let activitiesData = activitiesDataFromDb;
+    if (launchTrainingDone && !hasLaunchTrainingActivityInDb) {
+      let bestTs = 0;
+      for (const s of ltProgramSnapshot.sessions || []) {
+        const t = s.uploaded_at ? new Date(s.uploaded_at).getTime() : 0;
+        if (t > bestTs) bestTs = t;
+      }
+      const up = (project as any).updatedAt ? new Date((project as any).updatedAt).getTime() : 0;
+      if (up > bestTs) bestTs = up;
+      const created = bestTs ? new Date(bestTs) : new Date();
+      const createdIso = created.toISOString();
+      activitiesData = [
+        ...activitiesData,
+        {
+          description: 'Launch & Training (Site Visit Report) completed',
+          activity: ltStepDef?.name ?? 'Launch & Training (Site Visit Report)',
+          responsibility: ltStepDef?.responsibility ?? 'Admin',
+          created_at: createdIso,
+          formatted_date: created.toLocaleString('en-GB', {
+            day: '2-digit',
+            month: '2-digit',
+            year: 'numeric',
+            hour: '2-digit',
+            minute: '2-digit',
+            hour12: true,
+          }),
+          milestone_flow: ltFlowId,
+          milestone_completed: true,
+          activity_type: 'cii',
+        },
+      ].sort(
+        (a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime(),
+      );
+    }
     // After coordinator: next is Launch & Training (consultant), then Resource Center / PI phase (next_activities_id 8 until PI is uploaded).
     if (
       hasCoordinatorAssigned &&
@@ -2008,7 +2194,7 @@ export class CompanyProjectsService {
       latestStepDisplayName = milestoneSteps[7].name;
       latestStepDisplayResponsibility = milestoneSteps[7].responsibility;
       nextStepDisplayName = 'Launch & Training (Site Visit Report)';
-      nextStepDisplayResponsibility = 'Consultant';
+      nextStepDisplayResponsibility = 'Admin';
     }
     const workOrderRejectedByAdmin =
       hasProposalDocument &&
@@ -2055,8 +2241,20 @@ export class CompanyProjectsService {
       quickviewLaunchTrainingHeadline = true;
       latestStepDisplayName = 'Launch & Training (Site Visit Report) completed (Admin)';
       latestStepDisplayResponsibility = 'Admin';
-      nextStepDisplayName = 'Resource Center';
-      nextStepDisplayResponsibility = 'Admin';
+      nextStepDisplayName = 'CII to upload the PI/Tax Invoice';
+      nextStepDisplayResponsibility = 'CII';
+    }
+    const proformaApprovalStatus = Number((proformaInvoiceWithDocument as any)?.approval_status ?? -1);
+    if (proformaApprovalStatus === 2) {
+      latestStepDisplayName = 'CII rejected Proforma Invoice';
+      latestStepDisplayResponsibility = 'CII';
+      nextStepDisplayName = 'Company will Re pay 1st Performa Invoice';
+      nextStepDisplayResponsibility = 'Company';
+    } else if (proformaApprovalStatus === 1 && Number((project as any).next_activities_id || 0) >= 11) {
+      latestStepDisplayName = 'CII will Acknowlement Proforma Invoice';
+      latestStepDisplayResponsibility = 'CII';
+      nextStepDisplayName = 'Need to Upload Primary Data Form';
+      nextStepDisplayResponsibility = 'Company';
     }
 
     const projectCodePresent = !!String((project as any).project_id || '').trim();
@@ -2184,14 +2382,17 @@ export class CompanyProjectsService {
           milestone_flow: (() => {
             const n = normalizeMilestoneFlow(lastActivity);
             if (n != null) return n;
-            if (Number((lastActivity as any)?.milestone_flow) === 63) return 63;
+            const mf = Number((lastActivity as any)?.milestone_flow);
+            if (mf === 63 || mf === CompanyProjectsService.LAUNCH_TRAINING_MILESTONE_FLOW) {
+              return CompanyProjectsService.LAUNCH_TRAINING_MILESTONE_FLOW;
+            }
             const ld = String((lastActivity as any)?.description || '').toLowerCase();
             if (
               ld.includes('launch') &&
               ld.includes('training') &&
               (ld.includes('uploaded') || ld.includes('document'))
             ) {
-              return 63;
+              return CompanyProjectsService.LAUNCH_TRAINING_MILESTONE_FLOW;
             }
             return (project.next_activities_id || 1) - 1;
           })(),
@@ -2254,6 +2455,10 @@ export class CompanyProjectsService {
     for (const a of allActivities as any[]) {
       if (!a.milestone_completed) continue;
       const f = normalizeMilestoneFlow(a);
+      if (f === CompanyProjectsService.LAUNCH_TRAINING_MILESTONE_FLOW) {
+        explicitCompletedFlowNumbers.add(CompanyProjectsService.LAUNCH_TRAINING_MILESTONE_FLOW);
+        continue;
+      }
       if (f == null || f < 1 || f > 24) continue;
       if (f === 3 && !hasProposalDocument) continue;
       explicitCompletedFlowNumbers.add(f);
@@ -2266,6 +2471,49 @@ export class CompanyProjectsService {
       }
       completedFlowNumbers.add(flowNum);
     }
+    if (launchTrainingDone) {
+      completedFlowNumbers.add(CompanyProjectsService.LAUNCH_TRAINING_MILESTONE_FLOW);
+    }
+
+    const quickviewMilestoneFlowOrder: number[] = [
+      1, 2, 3, 4, 5, 6, 7, CompanyProjectsService.LAUNCH_TRAINING_MILESTONE_FLOW, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18,
+      19, 20, 21, 22, 23, 24,
+    ];
+    const launchTrainingStripReady =
+      hasCoordinatorAssigned &&
+      projectCodeAssigned &&
+      !workOrderRejectedByAdmin &&
+      !isProposalRejectedByCompany &&
+      !isRecertifiedAndAtCloseOut &&
+      !isAtCloseOutNoRecertify;
+
+    const ltMilestoneSlot = CompanyProjectsService.LAUNCH_TRAINING_MILESTONE_FLOW;
+    const milestoneStatusRows = quickviewMilestoneFlowOrder.map((flowNum) => {
+      let status: 'completed' | 'in_progress' | 'pending' = 'pending';
+      if (flowNum === ltMilestoneSlot) {
+        if (launchTrainingDone) {
+          status = 'completed';
+        } else if (launchTrainingStripReady && completedFlowNumbers.has(7)) {
+          status = 'in_progress';
+        }
+      } else if (completedFlowNumbers.has(flowNum)) {
+        status = 'completed';
+      } else if (flowNum === effectiveNextId) {
+        status = 'in_progress';
+      }
+      return {
+        flow: flowNum,
+        step: milestoneSteps[flowNum]?.name ?? '',
+        status,
+      };
+    });
+    const milestoneStatusByFlow = milestoneStatusRows.reduce(
+      (acc, row) => {
+        acc[row.flow] = row;
+        return acc;
+      },
+      {} as Record<number, { flow: number; step: string; status: string }>,
+    );
 
     return {
       status: 'success',
@@ -2300,23 +2548,100 @@ export class CompanyProjectsService {
             acc[n] = milestoneSteps[n].name;
             return acc;
           }, {} as Record<number, string>),
-          milestone_status: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24].reduce((acc, flowNum) => {
-            let status: 'completed' | 'in_progress' | 'pending' = 'pending';
-            if (completedFlowNumbers.has(flowNum)) {
-              status = 'completed';
-            } else if (flowNum === effectiveNextId) {
-              status = 'in_progress';
-            }
-            acc[flowNum] = {
-              flow: flowNum,
-              step: milestoneSteps[flowNum]?.name ?? '',
-              status,
-            };
-            return acc;
-          }, {} as Record<number, { flow: number; step: string; status: string }>),
+          milestone_status_timeline: milestoneStatusRows,
+          milestone_status: milestoneStatusByFlow,
         },
       },
     };
+  }
+
+  /**
+   * True when GET launch-training-program `data` shows at least one stored session or legacy doc (authoritative for UI tab).
+   */
+  private isLaunchTrainingProgramPayloadComplete(lt: unknown): boolean {
+    if (!lt || typeof lt !== 'object') return false;
+    const o = lt as Record<string, unknown>;
+    const n = Number(o.sessions_count);
+    if (Number.isFinite(n) && n > 0) return true;
+    const sessions = o.sessions;
+    if (Array.isArray(sessions)) {
+      for (const s of sessions) {
+        if (!s || typeof s !== 'object') continue;
+        const row = s as Record<string, unknown>;
+        const url = String(row.document_url ?? '').trim();
+        const path = String(row.document_path ?? '').trim();
+        if ((url && url !== 'null') || (path && path !== 'null')) return true;
+      }
+    }
+    const leg = o.legacy_single as Record<string, unknown> | undefined;
+    if (leg && String(leg.document_url ?? '').trim()) return true;
+    if (String(o.launch_training_document ?? '').trim()) return true;
+    return false;
+  }
+
+  /**
+   * Last pass for GET …/quickview: align milestone strip + activity log with `launch_training_program` so demo matches the Launch tab.
+   */
+  private applyLaunchTrainingProgramToQuickviewData(
+    data: Record<string, unknown>,
+    ltData: unknown,
+    ltStepName: string,
+    ltStepResponsibility: string,
+  ): void {
+    if (!this.isLaunchTrainingProgramPayloadComplete(ltData)) return;
+    const ltFlow = CompanyProjectsService.LAUNCH_TRAINING_MILESTONE_FLOW;
+    const mf = data.milestone_flow as Record<string, unknown> | undefined;
+    if (mf && typeof mf === 'object') {
+      const timeline = mf.milestone_status_timeline;
+      if (Array.isArray(timeline)) {
+        for (const row of timeline) {
+          if (row && typeof row === 'object' && Number((row as { flow?: number }).flow) === ltFlow) {
+            (row as { status: string }).status = 'completed';
+            const r = row as { step?: string };
+            if (!String(r.step || '').trim()) r.step = ltStepName;
+          }
+        }
+      }
+      const byFlow = mf.milestone_status as Record<number, { flow: number; step: string; status: string }> | undefined;
+      if (byFlow && byFlow[ltFlow]) {
+        byFlow[ltFlow].status = 'completed';
+        if (!String(byFlow[ltFlow].step || '').trim()) byFlow[ltFlow].step = ltStepName;
+      }
+    }
+    const rawLog = data.companies_activty;
+    if (!Array.isArray(rawLog)) return;
+    const hasLt = rawLog.some((e: unknown) => {
+      if (!e || typeof e !== 'object') return false;
+      const row = e as Record<string, unknown>;
+      const m = Number(row.milestone_flow);
+      if (m === ltFlow || m === 63) return true;
+      const t = `${row.description || ''} ${row.activity || ''}`.toLowerCase();
+      return t.includes('launch') && t.includes('training');
+    });
+    if (hasLt) return;
+    const now = new Date();
+    rawLog.push({
+      description: 'Launch & Training (Site Visit Report) completed',
+      activity: ltStepName,
+      responsibility: ltStepResponsibility,
+      created_at: now.toISOString(),
+      formatted_date: now.toLocaleString('en-GB', {
+        day: '2-digit',
+        month: '2-digit',
+        year: 'numeric',
+        hour: '2-digit',
+        minute: '2-digit',
+        hour12: true,
+      }),
+      milestone_flow: ltFlow,
+      milestone_completed: true,
+      activity_type: 'cii',
+    });
+    rawLog.sort(
+      (a: unknown, b: unknown) =>
+        new Date((a as { created_at: string }).created_at).getTime() -
+        new Date((b as { created_at: string }).created_at).getTime(),
+    );
   }
 
   /**
@@ -2366,23 +2691,32 @@ export class CompanyProjectsService {
   async getQuickviewDataForAdmin(projectIdOrCompanyId: string) {
     const { companyId, resolvedProjectId, resolution } =
       await this.resolveRegistrationIdsForAdminParam(projectIdOrCompanyId);
-    const [payload, launchTrainingProgram] = await Promise.all([
-      this.getQuickviewData(companyId, resolvedProjectId),
-      this.getLaunchTrainingProgramForAdmin(projectIdOrCompanyId),
-    ]);
+    /** Load first so quickview L&T / milestones match the same payload the Launch & Training tab uses. */
+    const launchTrainingProgram = await this.getLaunchTrainingProgramForAdmin(projectIdOrCompanyId);
+    const payload = await this.getQuickviewData(companyId, resolvedProjectId, {
+      launchTrainingProgramPayload: launchTrainingProgram.data as Record<string, unknown>,
+    });
+    const data = {
+      ...payload.data,
+      id_resolution: {
+        requested_id: projectIdOrCompanyId,
+        resolved_project_id: resolvedProjectId,
+        company_id: companyId,
+        resolution,
+      },
+      /** Same shape as `GET /api/admin/projects/:id/launch-training-program` for a single response. */
+      launch_training_program: launchTrainingProgram.data,
+    } as Record<string, unknown>;
+    /** Guarantees green milestone + log row whenever the Launch tab payload has files (avoids lean/heuristic drift). */
+    this.applyLaunchTrainingProgramToQuickviewData(
+      data,
+      launchTrainingProgram.data,
+      'Launch & Training (Site Visit Report)',
+      'Admin',
+    );
     return {
       ...payload,
-      data: {
-        ...payload.data,
-        id_resolution: {
-          requested_id: projectIdOrCompanyId,
-          resolved_project_id: resolvedProjectId,
-          company_id: companyId,
-          resolution,
-        },
-        /** Same shape as `GET /api/admin/projects/:id/launch-training-program` for a single response. */
-        launch_training_program: launchTrainingProgram.data,
-      },
+      data,
     };
   }
 
@@ -3229,6 +3563,8 @@ export class CompanyProjectsService {
   }
 
   private static readonly LAUNCH_TRAINING_MAX_SESSIONS = 4;
+  /** Quickview / activity log slot between coordinator (7) and PI (8); legacy activities may use 63 instead. */
+  private static readonly LAUNCH_TRAINING_MILESTONE_FLOW = 25;
 
   /** Normalize `company_id` from a lean project (ObjectId, string, or populated `{ _id }`). */
   private normalizeOwnerCompanyId(companyRef: unknown): string | null {
@@ -3725,7 +4061,7 @@ export class CompanyProjectsService {
       project_id: projectId,
       description: `Launch & Training session ${sessionIndex} document uploaded`,
       activity_type: 'cii',
-      milestone_flow: 63,
+      milestone_flow: CompanyProjectsService.LAUNCH_TRAINING_MILESTONE_FLOW,
       milestone_completed: true,
     });
 
@@ -4261,6 +4597,87 @@ export class CompanyProjectsService {
   }
 
   /**
+   * New Finance API: submit payment without invoiceId in URL.
+   * Uses latest invoice for selected payment_for and delegates to existing submitPayment flow.
+   */
+  async submitFinancePayment(
+    companyId: string,
+    projectId: string,
+    dto: SubmitFinancePaymentDto,
+    file?: Express.Multer.File,
+  ) {
+    const resolvedProjectId = await this.resolveProjectIdForCompanyFinance(
+      companyId,
+      projectId,
+    );
+    const companyOid = new Types.ObjectId(String(companyId));
+    const projectOid = new Types.ObjectId(String(resolvedProjectId));
+    const invoice = await this.companyInvoiceModel
+      .findOne({
+        $and: [
+          { $or: [{ company_id: String(companyId) }, { company_id: companyOid }] },
+          { $or: [{ project_id: String(resolvedProjectId) }, { project_id: projectOid }] },
+        ],
+        payment_for: dto.payment_for,
+      })
+      .sort({ createdAt: -1 });
+
+    if (!invoice) {
+      throw new NotFoundException({
+        status: 'error',
+        message:
+          dto.payment_for === PAYMENT_FOR_PROFORMA
+            ? 'Proforma invoice not found. Upload PI/Tax invoice first.'
+            : 'Tax invoice not found. Upload PI/Tax invoice first.',
+      });
+    }
+
+    return this.submitPayment(
+      companyId,
+      resolvedProjectId,
+      invoice._id.toString(),
+      {
+        payment_type: dto.payment_type,
+        trans_id: dto.trans_id,
+      },
+      file,
+    );
+  }
+
+  /**
+   * New Finance API: get payment status data (both or one invoice type).
+   */
+  async getFinancePayments(
+    companyId: string,
+    projectId: string,
+    paymentFor?: 'per_inv' | 'inv',
+  ) {
+    const resolvedProjectId = await this.resolveProjectIdForCompanyFinance(
+      companyId,
+      projectId,
+    );
+    if (paymentFor) {
+      return this.getInvoices(companyId, resolvedProjectId, paymentFor);
+    }
+
+    const [proforma, tax] = await Promise.all([
+      this.getInvoices(companyId, resolvedProjectId, 'per_inv'),
+      this.getInvoices(companyId, resolvedProjectId, 'inv'),
+    ]);
+
+    return {
+      status: 'success',
+      message: 'Finance payment status retrieved',
+      data: {
+        proforma_invoices: (proforma as any).data?.invoices || [],
+        tax_invoices: (tax as any).data?.invoices || [],
+        approval_status_labels: (proforma as any).data?.approval_status_labels || {},
+        approval_status_colors: (proforma as any).data?.approval_status_colors || {},
+      },
+    };
+  }
+
+  /**
    * Update invoice approval status (0=Pending, 1=Approved, 2=Rejected, 3=Under Review).
    */
   async updateInvoiceApprovalStatus(
@@ -4312,6 +4729,17 @@ export class CompanyProjectsService {
         (project as any).next_activities_id = 11;
         await project.save();
       }
+    } else if (approvalStatus === 2 && invoice.payment_for === PAYMENT_FOR_PROFORMA) {
+      await this.companyActivityModel.create({
+        company_id: companyId,
+        project_id: projectId,
+        description: 'CII rejected Proforma Invoice',
+        activity_type: 'cii',
+        milestone_flow: 10,
+        milestone_completed: true,
+      });
+      (project as any).next_activities_id = 9;
+      await project.save();
     }
 
     // When Approved (1) or Rejected (2), notify company and facilitator + email
@@ -5130,7 +5558,7 @@ export class CompanyProjectsService {
         next_activities_id: project.next_activities_id,
         next_activity: 'Launch & Training (Site Visit Report)',
         next_activity_status: 'Pending',
-        next_responsibility: 'Consultant',
+        next_responsibility: 'Admin',
       },
     };
   }
