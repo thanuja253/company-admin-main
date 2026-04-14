@@ -1935,7 +1935,7 @@ export class CompanyProjectsService {
     // Don't return 15+ until certificate is uploaded (so Recertification stays hidden until certificate phase is done).
     // Use merged milestone next id (activities + DB) so profile.next_activities_id matches next_activity labels.
     const hasCertificate = !!(project as any).certificate_document_url;
-    const effectiveNextId = !hasCertificate && nextMilestoneNumber >= 15 ? 14 : nextMilestoneNumber;
+    let effectiveNextId = !hasCertificate && nextMilestoneNumber >= 15 ? 14 : nextMilestoneNumber;
 
     // Step 24 display: if recertification started → "open new project"; if not → "Certificate created" / Completed
     const recertificationNewProjectId = (project as any).recertification_project_id?.toString?.() ?? (project as any).recertification_project_id;
@@ -2093,23 +2093,6 @@ export class CompanyProjectsService {
     const launchTrainingDoneFromProjectSignals =
       this.projectLaunchTrainingSessionsIndicateUpload(project as any) ||
       !!String((project as any).launch_training_document || '').trim();
-    /**
-     * Coordinator assignment sets `next_activities_id` to 8 before L&T is uploaded, so the pointer alone
-     * cannot mean L&T is done. If PI was uploaded, the service enforces L&T first — so a stored PI doc or
-     * logged milestone 8 proves the L&T gate was satisfied (including legacy rows missing session paths).
-     */
-    const launchTrainingDoneByPiEvidence =
-      !!(proformaInvoiceWithDocument &&
-        String((proformaInvoiceWithDocument as any).invoice_document || '').trim()) ||
-      (allActivities as any[]).some((a) => {
-        if (!a?.milestone_completed) return false;
-        if (Number(a?.milestone_flow) === 8) return true;
-        const d = String(a?.description || '').toLowerCase();
-        return (
-          (d.includes('proforma') && d.includes('invoice') && d.includes('upload')) ||
-          (d.includes('tax invoice') && d.includes('upload'))
-        );
-      });
     const ltPayload = quickviewOpts?.launchTrainingProgramPayload;
     const launchTrainingDoneFromProgramPayload =
       !!ltPayload &&
@@ -2122,19 +2105,28 @@ export class CompanyProjectsService {
           (ltPayload as any).legacy_single?.document_url &&
           String((ltPayload as any).legacy_single.document_url).trim()
         ));
-    /** If quickview has already advanced to PI/Tax invoice or beyond, treat L&T as completed in the strip/log. */
-    const launchTrainingDoneByNextStepFlow =
-      hasCoordinatorAssigned &&
-      nextMilestoneNumber >= 8 &&
-      nextStepDisplayName !== 'Launch & Training (Site Visit Report)';
     const launchTrainingDone =
       launchTrainingDoneFromLaunchTrainingGet ||
       launchTrainingActivityDone ||
       launchTrainingFromResourceDoc ||
       launchTrainingDoneFromProjectSignals ||
-      launchTrainingDoneByPiEvidence ||
-      launchTrainingDoneFromProgramPayload ||
-      launchTrainingDoneByNextStepFlow;
+      launchTrainingDoneFromProgramPayload;
+
+    // Enforce workflow order: Finance must not open before Launch & Training completion.
+    // If project is at/after finance pointer but L&T is not done, keep next step at L&T gate.
+    if (
+      hasCoordinatorAssigned &&
+      !launchTrainingDone &&
+      effectiveNextId >= 9 &&
+      !isRecertifiedAndAtCloseOut &&
+      !isAtCloseOutNoRecertify
+    ) {
+      effectiveNextId = 8;
+      nextStepDisplayName = 'Launch & Training (Site Visit Report)';
+      nextStepDisplayResponsibility = 'Admin';
+      latestStepDisplayName = milestoneSteps[7].name;
+      latestStepDisplayResponsibility = milestoneSteps[7].responsibility;
+    }
 
     const hasLaunchTrainingActivityInDb = (allActivities as any[]).some((a) => {
       if (!a?.milestone_completed) return false;
