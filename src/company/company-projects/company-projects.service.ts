@@ -4362,7 +4362,16 @@ export class CompanyProjectsService {
       approval_status_color: INVOICE_APPROVAL_STATUS_COLORS[inv.approval_status ?? 0] ?? 'warning',
       remarks: inv.remarks ?? inv.approval_remarks ?? null,
       reassign_key: Number(inv.reassign_key ?? 0),
-      can_resubmit: Number(inv.approval_status ?? 0) === 2,
+      can_resubmit: [2, 3].includes(Number(inv.approval_status ?? 0)),
+      reupload_documents: Array.isArray(inv.reupload_documents)
+        ? inv.reupload_documents.map((d: any) => ({
+            payment_type: d?.payment_type ?? null,
+            trans_id: d?.trans_id ?? null,
+            offline_tran_doc: d?.offline_tran_doc ? toUrl(d.offline_tran_doc) : null,
+            offline_tran_doc_filename: d?.offline_tran_doc_filename ?? null,
+            moved_at: d?.moved_at ?? null,
+          }))
+        : [],
       created_at: inv.createdAt,
       updated_at: inv.updatedAt,
     }));
@@ -4549,6 +4558,26 @@ export class CompanyProjectsService {
       ? `uploads/company/${companyId}/${file.filename}`
       : undefined;
 
+    // Preserve previous submitted payment details as reupload history when user submits again.
+    const previousSubmission = {
+      payment_type: invoice.payment_type,
+      trans_id: invoice.trans_id,
+      offline_tran_doc: invoice.offline_tran_doc,
+      offline_tran_doc_filename: invoice.offline_tran_doc_filename,
+      moved_at: new Date(),
+    };
+    const hasPreviousSubmission =
+      !!previousSubmission.payment_type ||
+      !!previousSubmission.trans_id ||
+      !!previousSubmission.offline_tran_doc ||
+      !!previousSubmission.offline_tran_doc_filename;
+    if (hasPreviousSubmission) {
+      const history = Array.isArray((invoice as any).reupload_documents)
+        ? (invoice as any).reupload_documents
+        : [];
+      (invoice as any).reupload_documents = [previousSubmission, ...history].slice(0, 10);
+    }
+
     invoice.payment_type = dto.payment_type;
     invoice.trans_id = dto.payment_type === 'Offline' ? dto.trans_id?.trim() : undefined;
     if (relativePath) {
@@ -4732,6 +4761,24 @@ export class CompanyProjectsService {
     (invoice as any).approval_remarks = normalizedRemarks;
     if (approvalStatus === 2) {
       // Not acknowledged/rejected: reopen payment form by clearing previously submitted payment details.
+      const previous = {
+        payment_type: invoice.payment_type,
+        trans_id: invoice.trans_id,
+        offline_tran_doc: invoice.offline_tran_doc,
+        offline_tran_doc_filename: invoice.offline_tran_doc_filename,
+        moved_at: new Date(),
+      };
+      const hasPrevious =
+        !!previous.payment_type ||
+        !!previous.trans_id ||
+        !!previous.offline_tran_doc ||
+        !!previous.offline_tran_doc_filename;
+      if (hasPrevious) {
+        const history = Array.isArray((invoice as any).reupload_documents)
+          ? (invoice as any).reupload_documents
+          : [];
+        (invoice as any).reupload_documents = [previous, ...history].slice(0, 10);
+      }
       invoice.payment_status = 0;
       invoice.payment_type = undefined;
       invoice.trans_id = undefined;
@@ -4814,7 +4861,22 @@ export class CompanyProjectsService {
         approval_status_label: statusLabel,
         remarks: (invoice as any).remarks ?? (invoice as any).approval_remarks ?? null,
         reassign_key: Number((invoice as any).reassign_key ?? 0),
-        can_resubmit: Number(invoice.approval_status ?? 0) === 2,
+        can_resubmit: [2, 3].includes(Number(invoice.approval_status ?? 0)),
+        reupload_documents: Array.isArray((invoice as any).reupload_documents)
+          ? ((invoice as any).reupload_documents as any[]).map((d: any) => ({
+              payment_type: d?.payment_type ?? null,
+              trans_id: d?.trans_id ?? null,
+              offline_tran_doc: d?.offline_tran_doc
+                ? d.offline_tran_doc.startsWith('http')
+                  ? d.offline_tran_doc
+                  : `${process.env.API_BASE_URL || 'http://localhost:3019'}/${String(
+                      d.offline_tran_doc,
+                    ).replace(/^\//, '')}`
+                : null,
+              offline_tran_doc_filename: d?.offline_tran_doc_filename ?? null,
+              moved_at: d?.moved_at ?? null,
+            }))
+          : [],
       },
     };
   }

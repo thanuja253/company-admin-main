@@ -66,6 +66,16 @@ export class CompanyInvoice {
   /** Increments when payment is not acknowledged/rejected; frontend can use as form re-open key. */
   @Prop({ default: 0 })
   reassign_key?: number;
+
+  /** Keeps old payment submissions when invoice is not acknowledged/rejected. */
+  @Prop({ type: Array, default: [] })
+  reupload_documents?: Array<{
+    payment_type?: string;
+    trans_id?: string;
+    offline_tran_doc?: string;
+    offline_tran_doc_filename?: string;
+    moved_at?: Date;
+  }>;
 }
 
 export const CompanyInvoiceSchema = SchemaFactory.createForClass(CompanyInvoice);
