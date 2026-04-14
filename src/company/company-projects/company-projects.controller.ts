@@ -36,7 +36,6 @@ import { AssignAssessorDto } from './dto/assign-assessor.dto';
 import { AssignFacilitatorDto } from './dto/assign-facilitator.dto';
 import { SubmitPaymentDto } from './dto/submit-payment.dto';
 import { SubmitFinancePaymentDto } from './dto/submit-finance-payment.dto';
-import { UpdateInvoiceApprovalDto } from './dto/update-invoice-approval.dto';
 import { UploadLaunchAndTrainingDto } from './dto/upload-launch-and-training.dto';
 import { AddLaunchTrainingSessionDto } from './dto/add-launch-training-session.dto';
 import { PrimaryDataStoreDto } from './dto/primary-data-store.dto';
@@ -1895,16 +1894,15 @@ export class CompanyProjectsController {
    * GET /api/company/projects/:projectId/proforma-invoices
    */
   @Get(':projectId/proforma-invoices')
-  @UseGuards(JwtAuthGuard, AccountStatusGuard)
   async getProformaInvoices(
     @Request() req,
     @Param('projectId') projectId: string,
   ): Promise<any> {
-    return this.companyProjectsService.getInvoices(
-      req.user.userId,
-      projectId,
-      'per_inv',
-    );
+    const companyId = req?.user?.userId;
+    if (companyId) {
+      return this.companyProjectsService.getInvoices(companyId, projectId, 'per_inv');
+    }
+    return this.companyProjectsService.getInvoicesOpen(projectId, 'per_inv');
   }
 
   /**
@@ -1912,16 +1910,15 @@ export class CompanyProjectsController {
    * GET /api/company/projects/:projectId/tax-invoices
    */
   @Get(':projectId/tax-invoices')
-  @UseGuards(JwtAuthGuard, AccountStatusGuard)
   async getTaxInvoices(
     @Request() req,
     @Param('projectId') projectId: string,
   ): Promise<any> {
-    return this.companyProjectsService.getInvoices(
-      req.user.userId,
-      projectId,
-      'inv',
-    );
+    const companyId = req?.user?.userId;
+    if (companyId) {
+      return this.companyProjectsService.getInvoices(companyId, projectId, 'inv');
+    }
+    return this.companyProjectsService.getInvoicesOpen(projectId, 'inv');
   }
 
   /**
@@ -1929,7 +1926,6 @@ export class CompanyProjectsController {
    * GET /api/company/projects/:projectId/finance/payments?payment_for=per_inv|inv
    */
   @Get(':projectId/finance/payments')
-  @UseGuards(JwtAuthGuard, AccountStatusGuard)
   async getFinancePayments(
     @Request() req,
     @Param('projectId') projectId: string,
@@ -1937,11 +1933,15 @@ export class CompanyProjectsController {
   ): Promise<any> {
     const normalized =
       paymentFor === 'per_inv' || paymentFor === 'inv' ? paymentFor : undefined;
-    return this.companyProjectsService.getFinancePayments(
-      req.user.userId,
-      projectId,
-      normalized,
-    );
+    const companyId = req?.user?.userId;
+    if (companyId) {
+      return this.companyProjectsService.getFinancePayments(
+        companyId,
+        projectId,
+        normalized,
+      );
+    }
+    return this.companyProjectsService.getFinancePaymentsOpen(projectId, normalized);
   }
 
   /**
@@ -2063,6 +2063,159 @@ export class CompanyProjectsController {
     );
   }
 
+  private mapFinancePaymentPayload(
+    body: any,
+    files: {
+      supporting_document?: Express.Multer.File[];
+      supportingdocument?: Express.Multer.File[];
+      supportingDocument?: Express.Multer.File[];
+      supporting_doc?: Express.Multer.File[];
+    },
+  ): { dto: SubmitPaymentDto; supportingDoc?: Express.Multer.File } {
+    const supportingDoc =
+      files?.supporting_document?.[0] ??
+      files?.supportingdocument?.[0] ??
+      files?.supportingDocument?.[0] ??
+      files?.supporting_doc?.[0];
+
+    const rawPaymentType =
+      body?.payment_type ??
+      body?.paymentMode ??
+      body?.payment_mode ??
+      body?.mode;
+    const paymentType =
+      String(rawPaymentType || '').toLowerCase() === 'offline' ? 'Offline' : 'Online';
+    const transactionId =
+      body?.trans_id ??
+      body?.transaction_id ??
+      body?.transactionId ??
+      body?.transactionID;
+
+    const dto: SubmitPaymentDto = {
+      payment_type: paymentType,
+      trans_id: transactionId,
+    };
+    return { dto, supportingDoc };
+  }
+
+  @Post(':projectId/proforma-invoices/:invoiceId/submit-payment')
+  @UseGuards(JwtAuthGuard, AccountStatusGuard)
+  @UsePipes(new ValidationPipe({ transform: true, whitelist: true }))
+  @UseInterceptors(
+    FileFieldsInterceptor(
+      [
+        { name: 'supporting_document', maxCount: 1 },
+        { name: 'supportingdocument', maxCount: 1 },
+        { name: 'supportingDocument', maxCount: 1 },
+        { name: 'supporting_doc', maxCount: 1 },
+      ],
+      {
+        storage: diskStorage({
+          destination: (req, file, cb) => {
+            const companyId = (req as any).user?.userId;
+            const uploadPath = join(process.cwd(), 'uploads', 'company', companyId || 'unknown');
+            if (!fs.existsSync(uploadPath)) {
+              fs.mkdirSync(uploadPath, { recursive: true });
+            }
+            cb(null, uploadPath);
+          },
+          filename: (req, file, cb) => {
+            const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1e9);
+            const ext = extname(file.originalname);
+            cb(null, `payment-${uniqueSuffix}${ext}`);
+          },
+        }),
+        limits: { fileSize: 10 * 1024 * 1024 },
+        fileFilter: (req, file, cb) => {
+          const allowed = ['application/pdf', 'image/jpeg', 'image/jpg', 'image/png'];
+          if (allowed.includes(file.mimetype)) cb(null, true);
+          else cb(new Error('Supporting document must be PDF, JPG, JPEG or PNG.'), false);
+        },
+      },
+    ),
+  )
+  async submitPaymentProformaLegacy(
+    @Request() req,
+    @Param('projectId') projectId: string,
+    @Param('invoiceId') invoiceId: string,
+    @Body() body: any,
+    @UploadedFiles()
+    files: {
+      supporting_document?: Express.Multer.File[];
+      supportingdocument?: Express.Multer.File[];
+      supportingDocument?: Express.Multer.File[];
+      supporting_doc?: Express.Multer.File[];
+    },
+  ): Promise<any> {
+    const { dto, supportingDoc } = this.mapFinancePaymentPayload(body, files);
+    return this.companyProjectsService.submitPayment(
+      req.user.userId,
+      projectId,
+      invoiceId,
+      dto,
+      supportingDoc,
+    );
+  }
+
+  @Post(':projectId/tax-invoices/:invoiceId/submit-payment')
+  @UseGuards(JwtAuthGuard, AccountStatusGuard)
+  @UsePipes(new ValidationPipe({ transform: true, whitelist: true }))
+  @UseInterceptors(
+    FileFieldsInterceptor(
+      [
+        { name: 'supporting_document', maxCount: 1 },
+        { name: 'supportingdocument', maxCount: 1 },
+        { name: 'supportingDocument', maxCount: 1 },
+        { name: 'supporting_doc', maxCount: 1 },
+      ],
+      {
+        storage: diskStorage({
+          destination: (req, file, cb) => {
+            const companyId = (req as any).user?.userId;
+            const uploadPath = join(process.cwd(), 'uploads', 'company', companyId || 'unknown');
+            if (!fs.existsSync(uploadPath)) {
+              fs.mkdirSync(uploadPath, { recursive: true });
+            }
+            cb(null, uploadPath);
+          },
+          filename: (req, file, cb) => {
+            const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1e9);
+            const ext = extname(file.originalname);
+            cb(null, `payment-${uniqueSuffix}${ext}`);
+          },
+        }),
+        limits: { fileSize: 10 * 1024 * 1024 },
+        fileFilter: (req, file, cb) => {
+          const allowed = ['application/pdf', 'image/jpeg', 'image/jpg', 'image/png'];
+          if (allowed.includes(file.mimetype)) cb(null, true);
+          else cb(new Error('Supporting document must be PDF, JPG, JPEG or PNG.'), false);
+        },
+      },
+    ),
+  )
+  async submitPaymentTaxLegacy(
+    @Request() req,
+    @Param('projectId') projectId: string,
+    @Param('invoiceId') invoiceId: string,
+    @Body() body: any,
+    @UploadedFiles()
+    files: {
+      supporting_document?: Express.Multer.File[];
+      supportingdocument?: Express.Multer.File[];
+      supportingDocument?: Express.Multer.File[];
+      supporting_doc?: Express.Multer.File[];
+    },
+  ): Promise<any> {
+    const { dto, supportingDoc } = this.mapFinancePaymentPayload(body, files);
+    return this.companyProjectsService.submitPayment(
+      req.user.userId,
+      projectId,
+      invoiceId,
+      dto,
+      supportingDoc,
+    );
+  }
+
   /**
    * Finance v2 compatibility: submit payment for Proforma invoice.
    * POST /api/company/projects/:projectId/finance/v2/proforma-invoices/:invoiceId/submit-payment
@@ -2124,15 +2277,7 @@ export class CompanyProjectsController {
       supporting_doc?: Express.Multer.File[];
     },
   ): Promise<any> {
-    const supportingDoc =
-      files?.supporting_document?.[0] ??
-      files?.supportingdocument?.[0] ??
-      files?.supportingDocument?.[0] ??
-      files?.supporting_doc?.[0];
-    const dto: SubmitPaymentDto = {
-      payment_type: body?.payment_type,
-      trans_id: body?.trans_id,
-    };
+    const { dto, supportingDoc } = this.mapFinancePaymentPayload(body, files);
     return this.companyProjectsService.submitPayment(
       req.user.userId,
       projectId,
@@ -2203,15 +2348,7 @@ export class CompanyProjectsController {
       supporting_doc?: Express.Multer.File[];
     },
   ): Promise<any> {
-    const supportingDoc =
-      files?.supporting_document?.[0] ??
-      files?.supportingdocument?.[0] ??
-      files?.supportingDocument?.[0] ??
-      files?.supporting_doc?.[0];
-    const dto: SubmitPaymentDto = {
-      payment_type: body?.payment_type,
-      trans_id: body?.trans_id,
-    };
+    const { dto, supportingDoc } = this.mapFinancePaymentPayload(body, files);
     return this.companyProjectsService.submitPayment(
       req.user.userId,
       projectId,
@@ -2302,18 +2439,125 @@ export class CompanyProjectsController {
    */
   @Patch(':projectId/invoices/:invoiceId/approval')
   @UseGuards(JwtAuthGuard, AccountStatusGuard)
-  @UsePipes(new ValidationPipe({ transform: true, whitelist: true }))
   async updateInvoiceApproval(
     @Request() req,
     @Param('projectId') projectId: string,
     @Param('invoiceId') invoiceId: string,
-    @Body() dto: UpdateInvoiceApprovalDto,
+    @Body() body: any,
   ): Promise<any> {
-    return this.companyProjectsService.updateInvoiceApprovalStatus(
+    const approvalStatus = this.normalizeInvoiceApprovalStatus(body);
+    const remarks = this.extractInvoiceApprovalRemarks(body);
+    return this.updateInvoiceApprovalInternal(
       req.user.userId,
       projectId,
       invoiceId,
-      dto.approval_status,
+      approvalStatus,
+      remarks,
+    );
+  }
+
+  @Patch(':projectId/proforma-invoices/:invoiceId/approval')
+  @UseGuards(JwtAuthGuard, AccountStatusGuard)
+  async updateProformaInvoiceApproval(
+    @Request() req,
+    @Param('projectId') projectId: string,
+    @Param('invoiceId') invoiceId: string,
+    @Body() body: any,
+  ): Promise<any> {
+    const approvalStatus = this.normalizeInvoiceApprovalStatus(body);
+    const remarks = this.extractInvoiceApprovalRemarks(body);
+    return this.updateInvoiceApprovalInternal(
+      req.user.userId,
+      projectId,
+      invoiceId,
+      approvalStatus,
+      remarks,
+    );
+  }
+
+  @Patch(':projectId/tax-invoices/:invoiceId/approval')
+  @UseGuards(JwtAuthGuard, AccountStatusGuard)
+  async updateTaxInvoiceApproval(
+    @Request() req,
+    @Param('projectId') projectId: string,
+    @Param('invoiceId') invoiceId: string,
+    @Body() body: any,
+  ): Promise<any> {
+    const approvalStatus = this.normalizeInvoiceApprovalStatus(body);
+    const remarks = this.extractInvoiceApprovalRemarks(body);
+    return this.updateInvoiceApprovalInternal(
+      req.user.userId,
+      projectId,
+      invoiceId,
+      approvalStatus,
+      remarks,
+    );
+  }
+
+  @Patch(':projectId/finance-v2/proforma-invoices/:invoiceId/approval')
+  @Patch(':projectId/finance-v2/tax-invoices/:invoiceId/approval')
+  @Patch(':projectId/finance/v2/proforma-invoices/:invoiceId/approval')
+  @Patch(':projectId/finance/v2/tax-invoices/:invoiceId/approval')
+  @UseGuards(JwtAuthGuard, AccountStatusGuard)
+  async updateFinanceV2InvoiceApproval(
+    @Request() req,
+    @Param('projectId') projectId: string,
+    @Param('invoiceId') invoiceId: string,
+    @Body() body: any,
+  ): Promise<any> {
+    const approvalStatus = this.normalizeInvoiceApprovalStatus(body);
+    const remarks = this.extractInvoiceApprovalRemarks(body);
+    return this.updateInvoiceApprovalInternal(
+      req.user.userId,
+      projectId,
+      invoiceId,
+      approvalStatus,
+      remarks,
+    );
+  }
+
+  private normalizeInvoiceApprovalStatus(body: any): number {
+    const rawStatus = body?.approval_status ?? body?.approvalStatus ?? body?.status;
+    const parsed = Number(rawStatus);
+    if (!Number.isFinite(parsed)) {
+      throw new BadRequestException({
+        status: 'error',
+        message:
+          'approval_status (or approvalStatus/status) must be a number (0, 1, 2, 3)',
+      });
+    }
+    if (![0, 1, 2, 3].includes(parsed)) {
+      throw new BadRequestException({
+        status: 'error',
+        message: 'Invalid approval status. Allowed values: 0, 1, 2, 3',
+      });
+    }
+    // Frontend compatibility: some clients send 3 as "Not Acknowledged" (rejection intent).
+    return parsed === 3 ? 2 : parsed;
+  }
+
+  private extractInvoiceApprovalRemarks(body: any): string | undefined {
+    const raw = body?.remarks ?? body?.approval_remarks;
+    if (raw === undefined || raw === null) {
+      return undefined;
+    }
+    const normalized = String(raw).trim();
+    return normalized.length > 0 ? normalized : undefined;
+  }
+
+  private updateInvoiceApprovalInternal(
+    companyId: string,
+    projectId: string,
+    invoiceId: string,
+    approvalStatus: number,
+    remarks?: string,
+  ): Promise<any> {
+    return this.companyProjectsService.updateInvoiceApprovalStatus(
+      companyId,
+      projectId,
+      invoiceId,
+      approvalStatus,
+      remarks,
     );
   }
 

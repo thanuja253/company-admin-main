@@ -55,6 +55,17 @@ export class CompanyInvoice {
   /** Approval status for display (COMPANY_APPROVAL_STATUS / APPROVAL_STATUS_COLORS) */
   @Prop({ default: 0 })
   approval_status?: number;
+
+  /** Optional approval remarks (frontend may send remarks/approval_remarks). */
+  @Prop()
+  remarks?: string;
+
+  @Prop()
+  approval_remarks?: string;
+
+  /** Increments when payment is not acknowledged/rejected; frontend can use as form re-open key. */
+  @Prop({ default: 0 })
+  reassign_key?: number;
 }
 
 export const CompanyInvoiceSchema = SchemaFactory.createForClass(CompanyInvoice);

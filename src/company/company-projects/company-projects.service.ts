@@ -4360,6 +4360,9 @@ export class CompanyProjectsService {
       approval_status: inv.approval_status ?? 0,
       approval_status_label: INVOICE_APPROVAL_STATUS[inv.approval_status ?? 0] ?? 'Pending',
       approval_status_color: INVOICE_APPROVAL_STATUS_COLORS[inv.approval_status ?? 0] ?? 'warning',
+      remarks: inv.remarks ?? inv.approval_remarks ?? null,
+      reassign_key: Number(inv.reassign_key ?? 0),
+      can_resubmit: Number(inv.approval_status ?? 0) === 2,
       created_at: inv.createdAt,
       updated_at: inv.updatedAt,
     }));
@@ -4571,17 +4574,11 @@ export class CompanyProjectsService {
 
     // When company pays Proforma invoice, advance next_activities_id to 10 (CII Acknowledged Proforma Invoice)
     if (invoice.payment_for === PAYMENT_FOR_PROFORMA) {
-      const project = await this.projectModel.findOne({ _id: projectId, company_id: companyId });
-      if (project) {
-        const currentNext =
-          typeof (project as any).next_activities_id === 'number'
-            ? (project as any).next_activities_id
-            : 0;
-        if (currentNext < 10) {
-          (project as any).next_activities_id = 10;
-          await project.save();
-        }
-      }
+      // Use direct update to avoid validating unrelated legacy fields on full document save.
+      await this.projectModel.updateOne(
+        { _id: projectId, company_id: companyId, next_activities_id: { $lt: 10 } },
+        { $set: { next_activities_id: 10 } },
+      );
     }
 
     return {
@@ -4678,6 +4675,30 @@ export class CompanyProjectsService {
   }
 
   /**
+   * Open/admin-friendly finance list API: resolves route param as project_id or company_id.
+   */
+  async getInvoicesOpen(
+    projectIdOrCompanyId: string,
+    paymentFor: 'per_inv' | 'inv',
+  ) {
+    const { companyId, resolvedProjectId } =
+      await this.resolveRegistrationIdsForAdminParam(projectIdOrCompanyId);
+    return this.getInvoices(companyId, resolvedProjectId, paymentFor);
+  }
+
+  /**
+   * Open/admin-friendly finance status API: resolves route param as project_id or company_id.
+   */
+  async getFinancePaymentsOpen(
+    projectIdOrCompanyId: string,
+    paymentFor?: 'per_inv' | 'inv',
+  ) {
+    const { companyId, resolvedProjectId } =
+      await this.resolveRegistrationIdsForAdminParam(projectIdOrCompanyId);
+    return this.getFinancePayments(companyId, resolvedProjectId, paymentFor);
+  }
+
+  /**
    * Update invoice approval status (0=Pending, 1=Approved, 2=Rejected, 3=Under Review).
    */
   async updateInvoiceApprovalStatus(
@@ -4685,6 +4706,7 @@ export class CompanyProjectsService {
     projectId: string,
     invoiceId: string,
     approvalStatus: number,
+    remarks?: string,
   ) {
     const project = await this.projectModel.findOne({
       _id: projectId,
@@ -4704,6 +4726,19 @@ export class CompanyProjectsService {
     }
 
     invoice.approval_status = approvalStatus;
+    const normalizedRemarks =
+      typeof remarks === 'string' && remarks.trim().length > 0 ? remarks.trim() : null;
+    (invoice as any).remarks = normalizedRemarks;
+    (invoice as any).approval_remarks = normalizedRemarks;
+    if (approvalStatus === 2) {
+      // Not acknowledged/rejected: reopen payment form by clearing previously submitted payment details.
+      invoice.payment_status = 0;
+      invoice.payment_type = undefined;
+      invoice.trans_id = undefined;
+      invoice.offline_tran_doc = undefined;
+      invoice.offline_tran_doc_filename = undefined;
+      (invoice as any).reassign_key = Number((invoice as any).reassign_key ?? 0) + 1;
+    }
     await invoice.save();
 
     const labels = ['Pending', 'Approved', 'Rejected', 'Under Review'];
@@ -4720,15 +4755,11 @@ export class CompanyProjectsService {
         milestone_completed: true,
       });
 
-      const currentNext =
-        typeof (project as any).next_activities_id === 'number'
-          ? (project as any).next_activities_id
-          : 0;
       // Next after 10 is 11 (Company Uploaded All Primary Data)
-      if (currentNext < 11) {
-        (project as any).next_activities_id = 11;
-        await project.save();
-      }
+      await this.projectModel.updateOne(
+        { _id: projectId, company_id: companyId, next_activities_id: { $lt: 11 } },
+        { $set: { next_activities_id: 11 } },
+      );
     } else if (approvalStatus === 2 && invoice.payment_for === PAYMENT_FOR_PROFORMA) {
       await this.companyActivityModel.create({
         company_id: companyId,
@@ -4738,8 +4769,10 @@ export class CompanyProjectsService {
         milestone_flow: 10,
         milestone_completed: true,
       });
-      (project as any).next_activities_id = 9;
-      await project.save();
+      await this.projectModel.updateOne(
+        { _id: projectId, company_id: companyId },
+        { $set: { next_activities_id: 9 } },
+      );
     }
 
     // When Approved (1) or Rejected (2), notify company and facilitator + email
@@ -4779,6 +4812,9 @@ export class CompanyProjectsService {
         invoice_id: invoice._id.toString(),
         approval_status: invoice.approval_status,
         approval_status_label: statusLabel,
+        remarks: (invoice as any).remarks ?? (invoice as any).approval_remarks ?? null,
+        reassign_key: Number((invoice as any).reassign_key ?? 0),
+        can_resubmit: Number(invoice.approval_status ?? 0) === 2,
       },
     };
   }
