@@ -56,6 +56,12 @@ import {
   getMilestoneCompletionNotifications,
   type WorkflowActor,
 } from './workflow-step-notifications';
+import {
+  sanitizeUnit,
+  latestByDataId,
+  EE_CALCULATED_CHECKLIST_ORDERS,
+  applyEeCalculationsByOrder,
+} from './utils/ee-calc';
 
 function parseUtcCalendarDateFromYmd(input: string): Date {
   const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(input || '').trim());
@@ -117,6 +123,9 @@ export const INVOICE_APPROVAL_STATUS_COLORS = ['warning', 'success', 'danger', '
 
 @Injectable()
 export class CompanyProjectsService {
+  private readonly EE_FY_KEYS: Array<'fy1' | 'fy2' | 'fy3' | 'fy4' | 'fy5'> = ['fy1', 'fy2', 'fy3', 'fy4', 'fy5'];
+  private readonly EE_ALLOWED_THERMAL_UNITS = new Set(['GJ', 'Kcal', 'MTOE', 'kWh']);
+
   private mapProposalStatusLabel(status: number | null | undefined): string {
     if (status === 1) return 'accepted_by_company';
     if (status === 2) return 'rejected_by_company';
@@ -4331,9 +4340,20 @@ export class CompanyProjectsService {
       .lean();
 
     const baseUrl = process.env.API_BASE_URL || 'http://localhost:3019';
-    const toUrl = (path: string | undefined) => {
-      if (!path) return null;
-      return path.startsWith('http') ? path : `${baseUrl}/${path.replace(/^\//, '')}`;
+    const toUrl = (storedPath: string | undefined) => {
+      if (!storedPath) return null;
+      let normalized = String(storedPath).trim();
+      if (!normalized) return null;
+      // Legacy DB rows may store localhost absolute URLs; normalize to /uploads/... and serve from configured API_BASE_URL.
+      if (normalized.startsWith('http://') || normalized.startsWith('https://')) {
+        const uploadsIdx = normalized.indexOf('/uploads/');
+        if (uploadsIdx >= 0) {
+          normalized = normalized.substring(uploadsIdx + 1); // remove leading slash
+        } else {
+          return normalized;
+        }
+      }
+      return `${baseUrl}/${normalized.replace(/^\//, '')}`;
     };
 
     const list = invoices.map((inv: any) => ({
@@ -4871,6 +4891,23 @@ export class CompanyProjectsService {
           : [],
       },
     };
+  }
+
+  async updateInvoiceApprovalStatusOpen(
+    projectIdOrCompanyId: string,
+    invoiceId: string,
+    approvalStatus: number,
+    remarks?: string,
+  ) {
+    const { companyId, resolvedProjectId } =
+      await this.resolveRegistrationIdsForAdminParam(projectIdOrCompanyId);
+    return this.updateInvoiceApprovalStatus(
+      companyId,
+      resolvedProjectId,
+      invoiceId,
+      approvalStatus,
+      remarks,
+    );
   }
 
   /**
@@ -5960,17 +5997,16 @@ export class CompanyProjectsService {
 
     const infoTypesFromMaster = [...new Set((masterList as any[]).map((r) => r.info_type).filter(Boolean))];
     const byInfoType: Record<string, any[]> = {};
-    const savedByDataId: Record<string, any> = {};
     for (const t of infoTypesFromMaster) {
       byInfoType[t] = [];
     }
-    for (const row of savedRows as any[]) {
+    const latestMap = latestByDataId(savedRows as any[]);
+    for (const row of Array.from(latestMap.values()) as any[]) {
       const t = row.info_type || 'gi';
       if (!byInfoType[t]) byInfoType[t] = [];
       byInfoType[t].push(row);
-      const dataIdStr = (row.data_id && row.data_id.toString) ? row.data_id.toString() : String(row.data_id);
-      if (dataIdStr) savedByDataId[dataIdStr] = row;
     }
+    const savedByDataId = Object.fromEntries(Array.from(latestMap.entries()));
 
     const finalSubmitCount = (savedRows as any[]).filter((r) => r.final_submit === 1).length;
     const approvalCount = (savedRows as any[]).filter((r) => r.document_status === PRIMARY_DATA_DOC_STATUS.ACCEPTED).length;
@@ -5979,10 +6015,8 @@ export class CompanyProjectsService {
     // primary_data_rows is keyed by info_type (gi, ee, wc, ...) so the UI can use primary_data_rows[activeSection].
     const mergedRowsFlat = (masterList as any[]).map((master) => {
       const mid = master._id?.toString?.() ?? master._id;
-      const saved = mid ? savedByDataId[mid] : null;
-      const refUnit = saved?.reference_unit != null && String(saved.reference_unit).trim() !== ''
-        ? String(saved.reference_unit)
-        : (master.reference_unit != null && String(master.reference_unit).trim() !== '' ? String(master.reference_unit) : '-');
+      const saved = mid ? latestMap.get(String(mid)) : null;
+      const refUnit = sanitizeUnit(saved?.reference_unit || master.reference_unit || '-');
       return {
         ...master,
         reference_unit: refUnit,
@@ -6009,6 +6043,21 @@ export class CompanyProjectsService {
       primary_data_rows[t].push(row);
     }
 
+    // Compute EE in-place by checklist_order (6,7 inputs -> 8..16,142 calculated).
+    const { rows: calculatedRows, issues: eeCalculationIssues } = applyEeCalculationsByOrder(primary_data_rows);
+    const calculatedOrderSet = new Set<number>(EE_CALCULATED_CHECKLIST_ORDERS as unknown as number[]);
+    if (Array.isArray(calculatedRows.ee)) {
+      // Keep only master-defined rows in same order; values are already updated in-place by helper.
+      calculatedRows.ee = calculatedRows.ee.sort((a, b) => Number(a?.checklist_order || 0) - Number(b?.checklist_order || 0));
+      // Ensure all calculated rows are still present for UI even when values are pending.
+      const existingOrders = new Set(calculatedRows.ee.map((r) => Number(r?.checklist_order)));
+      const missingCalc = (primary_data_rows.ee || []).filter(
+        (r) => calculatedOrderSet.has(Number(r?.checklist_order)) && !existingOrders.has(Number(r?.checklist_order)),
+      );
+      if (missingCalc.length) calculatedRows.ee = [...calculatedRows.ee, ...missingCalc];
+    }
+    Object.assign(primary_data_rows, calculatedRows);
+
     return {
       status: 'success',
       message: 'Primary data form retrieved',
@@ -6020,6 +6069,7 @@ export class CompanyProjectsService {
         primary_data_rows,
         final_submit_docs: finalSubmitCount,
         primary_data_approval_count: approvalCount,
+        ee_calculation_issues: eeCalculationIssues,
         document_status_labels: this.getPrimaryDataDocStatusLabels(),
         sections,
       },
@@ -6054,7 +6104,7 @@ export class CompanyProjectsService {
           data_id: dataId,
           info_type: infoType,
           parameter: row.parameter,
-          reference_unit: sectionRow.reference_unit ?? row.reference_unit,
+          reference_unit: sanitizeUnit(sectionRow.reference_unit ?? row.reference_unit ?? '-'),
           details: sectionRow.details,
           fy1: sectionRow.fy1 ?? 0,
           fy2: sectionRow.fy2 ?? 0,
@@ -6067,10 +6117,464 @@ export class CompanyProjectsService {
         });
       }
     }
+    if (String(formType || '').toLowerCase() === 'ee') {
+      doc = await this.prepareEePayloadForSave(companyId, projectId, doc);
+    }
     if (finalSubmit) {
       return this.submitPrimaryData(companyId, projectId, doc.length ? doc : []);
     }
     return this.storePrimaryData(companyId, projectId, doc);
+  }
+
+  private toFiniteNumber(value: unknown, defaultValue = 0): number {
+    const n = Number(value);
+    return Number.isFinite(n) ? n : defaultValue;
+  }
+
+  private roundTo(value: number, decimals = 4): number {
+    if (!Number.isFinite(value)) return 0;
+    const factor = 10 ** decimals;
+    return Math.round(value * factor) / factor;
+  }
+
+  private normalizeText(value: unknown): string {
+    return String(value ?? '')
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  private findEeRow(
+    masterRows: any[],
+    rowsByDataId: Map<string, any>,
+    options: { order?: number; keywords?: string[]; includeChecklistName?: boolean } = {},
+  ): any | undefined {
+    const { order, keywords = [], includeChecklistName = false } = options;
+
+    if (typeof order === 'number') {
+      const rowByOrder = masterRows.find((r) => Number(r?.checklist_order) === order);
+      if (rowByOrder) {
+        const key = rowByOrder?._id?.toString?.() ?? String(rowByOrder?._id ?? '');
+        return rowsByDataId.get(key);
+      }
+    }
+
+    if (!keywords.length) return undefined;
+
+    const keywordSet = keywords.map((k) => this.normalizeText(k));
+    for (const m of masterRows) {
+      const rowKey = m?._id?.toString?.() ?? String(m?._id ?? '');
+      const candidate = rowsByDataId.get(rowKey);
+      if (!candidate) continue;
+      const sources = [candidate?.parameter, m?.parameter];
+      if (includeChecklistName) sources.push(m?.checklist_name);
+      const candidateText = this.normalizeText(sources.filter(Boolean).join(' '));
+      if (keywordSet.every((k) => candidateText.includes(k))) {
+        return candidate;
+      }
+    }
+    return undefined;
+  }
+
+  private thermalToKwh(unit: unknown, quantity: unknown): number {
+    const qty = this.toFiniteNumber(quantity, 0);
+    const normalizedUnit = String(unit ?? '').trim();
+    if (normalizedUnit === 'GJ') return 277.778 * qty;
+    if (normalizedUnit === 'Kcal') return 0.00116222 * qty;
+    if (normalizedUnit === 'MTOE') return 11630 * qty;
+    if (normalizedUnit === 'kWh') return qty;
+    return 0;
+  }
+
+  private getFyValues(row: any): Record<'fy1' | 'fy2' | 'fy3' | 'fy4' | 'fy5', number> {
+    const out = {} as Record<'fy1' | 'fy2' | 'fy3' | 'fy4' | 'fy5', number>;
+    for (const fy of this.EE_FY_KEYS) {
+      out[fy] = this.toFiniteNumber(row?.[fy], 0);
+    }
+    return out;
+  }
+
+  private setFyValues(target: any, values: Partial<Record<'fy1' | 'fy2' | 'fy3' | 'fy4' | 'fy5', number>>) {
+    for (const fy of this.EE_FY_KEYS) {
+      if (values[fy] == null) continue;
+      target[fy] = this.roundTo(this.toFiniteNumber(values[fy], 0));
+    }
+  }
+
+  private async getEquivalentProductFromGi(
+    companyId: string,
+    projectId: string,
+  ): Promise<Record<'fy1' | 'fy2' | 'fy3' | 'fy4' | 'fy5', number>> {
+    const mongoose = require('mongoose');
+    const pId = new mongoose.Types.ObjectId(projectId);
+    const giRow = await this.primaryDataFormModel
+      .findOne({
+        company_id: companyId,
+        project_id: pId,
+        info_type: 'gi',
+        parameter: { $regex: /equivalent\s*product/i },
+      })
+      .lean();
+
+    if (giRow) return this.getFyValues(giRow);
+
+    const giMasterRow = await this.masterPrimaryDataChecklistModel
+      .findOne({ info_type: 'gi', checklist_order: 4, is_active: 1 })
+      .lean();
+
+    if (!giMasterRow?._id) {
+      return { fy1: 0, fy2: 0, fy3: 0, fy4: 0, fy5: 0 };
+    }
+
+    const giByOrderRow = await this.primaryDataFormModel
+      .findOne({
+        company_id: companyId,
+        project_id: pId,
+        data_id: giMasterRow._id,
+      })
+      .lean();
+
+    return this.getFyValues(giByOrderRow || {});
+  }
+
+  private assertEeInputs(eeRow6: any | undefined) {
+    if (!eeRow6) return;
+    const details = String(eeRow6?.details ?? '').trim();
+    if (!details) {
+      throw new BadRequestException({
+        status: 'error',
+        message: 'EE validation failed: details is required for EE row 6.',
+      });
+    }
+
+    for (const fy of ['fy1', 'fy2', 'fy3', 'fy4'] as const) {
+      const value = this.toFiniteNumber(eeRow6?.[fy], NaN);
+      if (!Number.isFinite(value) || value <= 0) {
+        throw new BadRequestException({
+          status: 'error',
+          message: `EE validation failed: ${fy} must be a positive number for EE row 6.`,
+        });
+      }
+    }
+  }
+
+  private assertEeThermalInputs(thermalRow: any | undefined) {
+    if (!thermalRow) {
+      throw new BadRequestException({
+        status: 'error',
+        message: 'EE validation failed: thermal energy row is required.',
+      });
+    }
+    for (const fy of ['fy1', 'fy2', 'fy3', 'fy4'] as const) {
+      const value = this.toFiniteNumber(thermalRow?.[fy], NaN);
+      if (!Number.isFinite(value)) {
+        throw new BadRequestException({
+          status: 'error',
+          message: `EE validation failed: ${fy} must be numeric for thermal energy row.`,
+        });
+      }
+    }
+  }
+
+  private applyEeCalculations(
+    rowsByDataId: Map<string, any>,
+    masterRows: any[],
+    equivalentProduct: Record<'fy1' | 'fy2' | 'fy3' | 'fy4' | 'fy5', number>,
+  ) {
+    const electricalRow =
+      this.findEeRow(masterRows, rowsByDataId, { order: 6 }) ||
+      this.findEeRow(masterRows, rowsByDataId, {
+        keywords: ['electrical', 'energy', 'consumption'],
+        includeChecklistName: true,
+      });
+    const thermalRow =
+      this.findEeRow(masterRows, rowsByDataId, { order: 7 }) ||
+      this.findEeRow(masterRows, rowsByDataId, {
+        keywords: ['thermal', 'energy', 'consumption'],
+        includeChecklistName: true,
+      });
+    const thermalKwhRow =
+      this.findEeRow(masterRows, rowsByDataId, { order: 8 }) ||
+      this.findEeRow(masterRows, rowsByDataId, {
+        keywords: ['thermal', 'kwh'],
+        includeChecklistName: true,
+      });
+    const totalEnergyRow =
+      this.findEeRow(masterRows, rowsByDataId, { order: 9 }) ||
+      this.findEeRow(masterRows, rowsByDataId, {
+        keywords: ['total', 'energy', 'consumption'],
+        includeChecklistName: true,
+      });
+    const shareElectricalRow =
+      this.findEeRow(masterRows, rowsByDataId, { order: 10 }) ||
+      this.findEeRow(masterRows, rowsByDataId, {
+        keywords: ['share', 'electrical'],
+        includeChecklistName: true,
+      });
+    const shareThermalRow =
+      this.findEeRow(masterRows, rowsByDataId, { order: 11 }) ||
+      this.findEeRow(masterRows, rowsByDataId, {
+        keywords: ['share', 'thermal'],
+        includeChecklistName: true,
+      });
+    const specificElectricalRow =
+      this.findEeRow(masterRows, rowsByDataId, { order: 12 }) ||
+      this.findEeRow(masterRows, rowsByDataId, {
+        keywords: ['specific', 'electrical'],
+        includeChecklistName: true,
+      });
+    const specificThermalRow =
+      this.findEeRow(masterRows, rowsByDataId, { order: 13 }) ||
+      this.findEeRow(masterRows, rowsByDataId, {
+        keywords: ['specific', 'thermal'],
+        includeChecklistName: true,
+      });
+    const specificTotalKwhRow =
+      this.findEeRow(masterRows, rowsByDataId, { order: 14 }) ||
+      this.findEeRow(masterRows, rowsByDataId, {
+        keywords: ['specific', 'total', 'kwh'],
+        includeChecklistName: true,
+      });
+    const specificTotalGjRow =
+      this.findEeRow(masterRows, rowsByDataId, { order: 15 }) ||
+      this.findEeRow(masterRows, rowsByDataId, {
+        keywords: ['specific', 'total', 'gj'],
+        includeChecklistName: true,
+      });
+    const reductionRow =
+      this.findEeRow(masterRows, rowsByDataId, { order: 16 }) ||
+      this.findEeRow(masterRows, rowsByDataId, {
+        keywords: ['reduction', 'specific', 'energy'],
+        includeChecklistName: true,
+      });
+    const reductionRow142 = this.findEeRow(masterRows, rowsByDataId, { order: 142 });
+
+    if (!electricalRow) {
+      throw new BadRequestException({
+        status: 'error',
+        message: 'EE validation failed: electrical energy row is required.',
+      });
+    }
+    this.assertEeInputs(electricalRow);
+    this.assertEeThermalInputs(thermalRow);
+
+    const electrical = this.getFyValues(electricalRow || {});
+    const thermal = this.getFyValues(thermalRow || {});
+
+    const thermalInKwh: Record<'fy1' | 'fy2' | 'fy3' | 'fy4' | 'fy5', number> = {
+      fy1: 0,
+      fy2: 0,
+      fy3: 0,
+      fy4: 0,
+      fy5: 0,
+    };
+    const totalEnergyKwh: Record<'fy1' | 'fy2' | 'fy3' | 'fy4' | 'fy5', number> = {
+      fy1: 0,
+      fy2: 0,
+      fy3: 0,
+      fy4: 0,
+      fy5: 0,
+    };
+    const shareElectrical: Record<'fy1' | 'fy2' | 'fy3' | 'fy4' | 'fy5', number> = {
+      fy1: 0,
+      fy2: 0,
+      fy3: 0,
+      fy4: 0,
+      fy5: 0,
+    };
+    const shareThermal: Record<'fy1' | 'fy2' | 'fy3' | 'fy4' | 'fy5', number> = {
+      fy1: 0,
+      fy2: 0,
+      fy3: 0,
+      fy4: 0,
+      fy5: 0,
+    };
+    const specificElectrical: Record<'fy1' | 'fy2' | 'fy3' | 'fy4' | 'fy5', number> = {
+      fy1: 0,
+      fy2: 0,
+      fy3: 0,
+      fy4: 0,
+      fy5: 0,
+    };
+    const specificThermal: Record<'fy1' | 'fy2' | 'fy3' | 'fy4' | 'fy5', number> = {
+      fy1: 0,
+      fy2: 0,
+      fy3: 0,
+      fy4: 0,
+      fy5: 0,
+    };
+    const specificTotalKwh: Record<'fy1' | 'fy2' | 'fy3' | 'fy4' | 'fy5', number> = {
+      fy1: 0,
+      fy2: 0,
+      fy3: 0,
+      fy4: 0,
+      fy5: 0,
+    };
+    const specificTotalGj: Record<'fy1' | 'fy2' | 'fy3' | 'fy4' | 'fy5', number> = {
+      fy1: 0,
+      fy2: 0,
+      fy3: 0,
+      fy4: 0,
+      fy5: 0,
+    };
+    const reductionSpecific: Record<'fy1' | 'fy2' | 'fy3' | 'fy4' | 'fy5', number> = {
+      fy1: 0,
+      fy2: 0,
+      fy3: 0,
+      fy4: 0,
+      fy5: 0,
+    };
+
+    for (const fy of this.EE_FY_KEYS) {
+      thermalInKwh[fy] = this.thermalToKwh(thermalRow?.reference_unit, thermal[fy]);
+      totalEnergyKwh[fy] = electrical[fy] + thermalInKwh[fy];
+      shareElectrical[fy] = totalEnergyKwh[fy] > 0 ? (electrical[fy] / totalEnergyKwh[fy]) * 100 : 0;
+      shareThermal[fy] = totalEnergyKwh[fy] > 0 ? (thermalInKwh[fy] / totalEnergyKwh[fy]) * 100 : 0;
+
+      const equivalent = this.toFiniteNumber(equivalentProduct[fy], 0);
+      specificElectrical[fy] = equivalent > 0 ? electrical[fy] / equivalent : 0;
+      specificThermal[fy] = equivalent > 0 ? thermalInKwh[fy] / equivalent : 0;
+      specificTotalKwh[fy] = equivalent > 0 ? totalEnergyKwh[fy] / equivalent : 0;
+      specificTotalGj[fy] = specificTotalKwh[fy] / 277.778;
+    }
+
+    // Year-over-year reduction; extrapolated compares FY4 to FY5.
+    reductionSpecific.fy1 = 0;
+    reductionSpecific.fy2 = specificTotalKwh.fy1 > 0
+      ? ((specificTotalKwh.fy1 - specificTotalKwh.fy2) / specificTotalKwh.fy1) * 100
+      : 0;
+    reductionSpecific.fy3 = specificTotalKwh.fy2 > 0
+      ? ((specificTotalKwh.fy2 - specificTotalKwh.fy3) / specificTotalKwh.fy2) * 100
+      : 0;
+    reductionSpecific.fy4 = specificTotalKwh.fy3 > 0
+      ? ((specificTotalKwh.fy3 - specificTotalKwh.fy4) / specificTotalKwh.fy3) * 100
+      : 0;
+    reductionSpecific.fy5 = specificTotalKwh.fy4 > 0
+      ? ((specificTotalKwh.fy4 - specificTotalKwh.fy5) / specificTotalKwh.fy4) * 100
+      : 0;
+
+    if (thermalKwhRow) this.setFyValues(thermalKwhRow, thermalInKwh);
+    if (totalEnergyRow) this.setFyValues(totalEnergyRow, totalEnergyKwh);
+    if (shareElectricalRow) this.setFyValues(shareElectricalRow, shareElectrical);
+    if (shareThermalRow) this.setFyValues(shareThermalRow, shareThermal);
+    if (specificElectricalRow) this.setFyValues(specificElectricalRow, specificElectrical);
+    if (specificThermalRow) this.setFyValues(specificThermalRow, specificThermal);
+    if (specificTotalKwhRow) this.setFyValues(specificTotalKwhRow, specificTotalKwh);
+    if (specificTotalGjRow) this.setFyValues(specificTotalGjRow, specificTotalGj);
+    if (reductionRow) this.setFyValues(reductionRow, reductionSpecific);
+    if (reductionRow142) this.setFyValues(reductionRow142, reductionSpecific);
+  }
+
+  private async prepareEePayloadForSave(companyId: string, projectId: string, incomingDoc: any[]): Promise<any[]> {
+    const mongoose = require('mongoose');
+    const pId = new mongoose.Types.ObjectId(projectId);
+
+    const [masterRows, existingRows] = await Promise.all([
+      this.masterPrimaryDataChecklistModel
+        .find({ info_type: 'ee', is_active: 1 })
+        .sort({ checklist_order: 1 })
+        .lean(),
+      this.primaryDataFormModel
+        .find({ company_id: companyId, project_id: pId, info_type: 'ee' })
+        .lean(),
+    ]);
+
+    const byMasterDataId = new Map<string, any>();
+    for (const m of masterRows as any[]) {
+      const id = m?._id?.toString?.() ?? String(m?._id ?? '');
+      byMasterDataId.set(id, m);
+    }
+
+    const rowsByDataId = new Map<string, any>();
+    for (const row of existingRows as any[]) {
+      const id = row?.data_id?.toString?.() ?? String(row?.data_id ?? '');
+      if (!id) continue;
+      rowsByDataId.set(id, { ...row, data_id: id, info_type: 'ee' });
+    }
+
+    for (const row of incomingDoc || []) {
+      const id = row?.data_id?.toString?.() ?? String(row?.data_id ?? '');
+      if (!id) continue;
+      const master = byMasterDataId.get(id);
+      const prev = rowsByDataId.get(id) || {};
+      rowsByDataId.set(id, {
+        ...prev,
+        ...row,
+        data_id: id,
+        info_type: 'ee',
+        parameter: row?.parameter ?? prev?.parameter ?? master?.parameter,
+        reference_unit: sanitizeUnit(row?.reference_unit ?? prev?.reference_unit ?? master?.reference_unit ?? '-'),
+      });
+    }
+
+    for (const [id, master] of byMasterDataId.entries()) {
+      if (rowsByDataId.has(id)) continue;
+      rowsByDataId.set(id, {
+        data_id: id,
+        info_type: 'ee',
+        parameter: master?.parameter,
+        reference_unit: sanitizeUnit(master?.reference_unit ?? '-'),
+        fy1: 0,
+        fy2: 0,
+        fy3: 0,
+        fy4: 0,
+        fy5: 0,
+      });
+    }
+
+    const thermalRow =
+      this.findEeRow(masterRows as any[], rowsByDataId, { order: 7 }) ||
+      this.findEeRow(masterRows as any[], rowsByDataId, {
+        keywords: ['thermal', 'energy', 'consumption'],
+        includeChecklistName: true,
+      });
+    const electricalRow =
+      this.findEeRow(masterRows as any[], rowsByDataId, { order: 6 }) ||
+      this.findEeRow(masterRows as any[], rowsByDataId, {
+        keywords: ['electrical', 'energy', 'consumption'],
+        includeChecklistName: true,
+      });
+    if (!electricalRow || !thermalRow) {
+      throw new BadRequestException({
+        status: 'error',
+        message:
+          'EE setup error: master_primary_data_checklist must include both Electrical energy consumption and Thermal energy consumption rows.',
+      });
+    }
+    if (thermalRow?.reference_unit && !this.EE_ALLOWED_THERMAL_UNITS.has(String(thermalRow.reference_unit).trim())) {
+      throw new BadRequestException({
+        status: 'error',
+        message: 'EE validation failed: Thermal energy reference_unit must be one of GJ, Kcal, MTOE, kWh.',
+      });
+    }
+
+    const equivalentProduct = await this.getEquivalentProductFromGi(companyId, projectId);
+    if (!['fy1', 'fy2', 'fy3', 'fy4'].every((fy) => this.toFiniteNumber((equivalentProduct as any)[fy], 0) > 0)) {
+      throw new BadRequestException({
+        status: 'error',
+        message:
+          'EE validation failed: GI equivalent product row must exist with FY1-FY4 values greater than 0.',
+      });
+    }
+    this.applyEeCalculations(rowsByDataId, masterRows as any[], equivalentProduct);
+
+    return Array.from(rowsByDataId.values()).map((row) => ({
+      data_id: row.data_id,
+      info_type: 'ee',
+      parameter: row.parameter,
+      reference_unit: row.reference_unit,
+      details: row.details,
+      fy1: this.toFiniteNumber(row.fy1, 0),
+      fy2: this.toFiniteNumber(row.fy2, 0),
+      fy3: this.toFiniteNumber(row.fy3, 0),
+      fy4: this.toFiniteNumber(row.fy4, 0),
+      fy5: this.toFiniteNumber(row.fy5, 0),
+      extrapolated: row.extrapolated != null ? this.toFiniteNumber(row.extrapolated, 0) : undefined,
+      lt_target: row.lt_target != null ? this.toFiniteNumber(row.lt_target, 0) : undefined,
+      additional_details: row.additional_details,
+    }));
   }
 
   /**
@@ -6115,7 +6619,7 @@ export class CompanyProjectsService {
       const update: any = {
         info_type: item.info_type || 'gi',
         parameter: item.parameter,
-        reference_unit: item.reference_unit,
+        reference_unit: sanitizeUnit(item.reference_unit ?? '-'),
         details: item.details,
         fy1: toNum(item.fy1) ?? 0,
         fy2: toNum(item.fy2) ?? 0,
@@ -6128,7 +6632,7 @@ export class CompanyProjectsService {
       };
 
       await this.primaryDataFormModel.updateOne(
-        { company_id: cId, project_id: pId, data_id: dataId },
+        { company_id: cId, project_id: pId, info_type: update.info_type, data_id: dataId },
         { $set: update },
         { upsert: true },
       );
@@ -6477,7 +6981,7 @@ export class CompanyProjectsService {
         const update = {
           info_type: section,
           parameter: obj.parameter,
-          reference_unit: obj.reference_unit,
+          reference_unit: sanitizeUnit(obj.reference_unit ?? '-'),
           details: obj.details,
           fy1: Number(obj.fy1) || 0,
           fy2: Number(obj.fy2) || 0,
@@ -6488,7 +6992,7 @@ export class CompanyProjectsService {
           lt_target: obj.lt_target != null ? Number(obj.lt_target) : undefined,
         };
         await this.primaryDataFormModel.updateOne(
-          { company_id: cId, project_id: pId, data_id: dataIdObj },
+          { company_id: cId, project_id: pId, info_type: section, data_id: dataIdObj },
           { $set: update },
           { upsert: true },
         );
@@ -6496,6 +7000,10 @@ export class CompanyProjectsService {
       } catch (_) {
         // skip invalid data_id
       }
+    }
+    if (String(section || '').toLowerCase() === 'ee') {
+      const recalculatedDoc = await this.prepareEePayloadForSave(companyId, projectId, []);
+      await this.storePrimaryData(companyId, projectId, recalculatedDoc);
     }
     return {
       status: 'success',

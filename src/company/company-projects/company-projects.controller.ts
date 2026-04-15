@@ -18,7 +18,7 @@ import {
   BadRequestException,
 } from '@nestjs/common';
 import { Response } from 'express';
-import { FileFieldsInterceptor, FileInterceptor } from '@nestjs/platform-express';
+import { AnyFilesInterceptor, FileFieldsInterceptor, FileInterceptor } from '@nestjs/platform-express';
 import { UploadedFile } from '@nestjs/common';
 import { diskStorage, memoryStorage } from 'multer';
 import { extname } from 'path';
@@ -2065,18 +2065,30 @@ export class CompanyProjectsController {
 
   private mapFinancePaymentPayload(
     body: any,
-    files: {
-      supporting_document?: Express.Multer.File[];
-      supportingdocument?: Express.Multer.File[];
-      supportingDocument?: Express.Multer.File[];
-      supporting_doc?: Express.Multer.File[];
-    },
+    files:
+      | {
+          supporting_document?: Express.Multer.File[];
+          supportingdocument?: Express.Multer.File[];
+          supportingDocument?: Express.Multer.File[];
+          supporting_doc?: Express.Multer.File[];
+        }
+      | Express.Multer.File[],
   ): { dto: SubmitPaymentDto; supportingDoc?: Express.Multer.File } {
-    const supportingDoc =
-      files?.supporting_document?.[0] ??
-      files?.supportingdocument?.[0] ??
-      files?.supportingDocument?.[0] ??
-      files?.supporting_doc?.[0];
+    let supportingDoc: Express.Multer.File | undefined;
+    if (Array.isArray(files)) {
+      const picked = files.find((f) =>
+        ['supporting_document', 'supportingdocument', 'supportingDocument', 'supporting_doc', 'supporting_document[]', 'supportingdocument[]', 'file'].includes(
+          String((f as any)?.fieldname || ''),
+        ),
+      );
+      supportingDoc = picked ?? files[0];
+    } else {
+      supportingDoc =
+        files?.supporting_document?.[0] ??
+        files?.supportingdocument?.[0] ??
+        files?.supportingDocument?.[0] ??
+        files?.supporting_doc?.[0];
+    }
 
     const rawPaymentType =
       body?.payment_type ??
@@ -2102,50 +2114,36 @@ export class CompanyProjectsController {
   @UseGuards(JwtAuthGuard, AccountStatusGuard)
   @UsePipes(new ValidationPipe({ transform: true, whitelist: true }))
   @UseInterceptors(
-    FileFieldsInterceptor(
-      [
-        { name: 'supporting_document', maxCount: 1 },
-        { name: 'supportingdocument', maxCount: 1 },
-        { name: 'supportingDocument', maxCount: 1 },
-        { name: 'supporting_doc', maxCount: 1 },
-      ],
-      {
-        storage: diskStorage({
-          destination: (req, file, cb) => {
-            const companyId = (req as any).user?.userId;
-            const uploadPath = join(process.cwd(), 'uploads', 'company', companyId || 'unknown');
-            if (!fs.existsSync(uploadPath)) {
-              fs.mkdirSync(uploadPath, { recursive: true });
-            }
-            cb(null, uploadPath);
-          },
-          filename: (req, file, cb) => {
-            const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1e9);
-            const ext = extname(file.originalname);
-            cb(null, `payment-${uniqueSuffix}${ext}`);
-          },
-        }),
-        limits: { fileSize: 10 * 1024 * 1024 },
-        fileFilter: (req, file, cb) => {
-          const allowed = ['application/pdf', 'image/jpeg', 'image/jpg', 'image/png'];
-          if (allowed.includes(file.mimetype)) cb(null, true);
-          else cb(new Error('Supporting document must be PDF, JPG, JPEG or PNG.'), false);
+    AnyFilesInterceptor({
+      storage: diskStorage({
+        destination: (req, file, cb) => {
+          const companyId = (req as any).user?.userId;
+          const uploadPath = join(process.cwd(), 'uploads', 'company', companyId || 'unknown');
+          if (!fs.existsSync(uploadPath)) {
+            fs.mkdirSync(uploadPath, { recursive: true });
+          }
+          cb(null, uploadPath);
         },
+        filename: (req, file, cb) => {
+          const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1e9);
+          const ext = extname(file.originalname);
+          cb(null, `payment-${uniqueSuffix}${ext}`);
+        },
+      }),
+      limits: { fileSize: 10 * 1024 * 1024 },
+      fileFilter: (req, file, cb) => {
+        const allowed = ['application/pdf', 'image/jpeg', 'image/jpg', 'image/png'];
+        if (allowed.includes(file.mimetype)) cb(null, true);
+        else cb(new Error('Supporting document must be PDF, JPG, JPEG or PNG.'), false);
       },
-    ),
+    }),
   )
   async submitPaymentProformaLegacy(
     @Request() req,
     @Param('projectId') projectId: string,
     @Param('invoiceId') invoiceId: string,
     @Body() body: any,
-    @UploadedFiles()
-    files: {
-      supporting_document?: Express.Multer.File[];
-      supportingdocument?: Express.Multer.File[];
-      supportingDocument?: Express.Multer.File[];
-      supporting_doc?: Express.Multer.File[];
-    },
+    @UploadedFiles() files: Express.Multer.File[],
   ): Promise<any> {
     const { dto, supportingDoc } = this.mapFinancePaymentPayload(body, files);
     return this.companyProjectsService.submitPayment(
@@ -2161,50 +2159,36 @@ export class CompanyProjectsController {
   @UseGuards(JwtAuthGuard, AccountStatusGuard)
   @UsePipes(new ValidationPipe({ transform: true, whitelist: true }))
   @UseInterceptors(
-    FileFieldsInterceptor(
-      [
-        { name: 'supporting_document', maxCount: 1 },
-        { name: 'supportingdocument', maxCount: 1 },
-        { name: 'supportingDocument', maxCount: 1 },
-        { name: 'supporting_doc', maxCount: 1 },
-      ],
-      {
-        storage: diskStorage({
-          destination: (req, file, cb) => {
-            const companyId = (req as any).user?.userId;
-            const uploadPath = join(process.cwd(), 'uploads', 'company', companyId || 'unknown');
-            if (!fs.existsSync(uploadPath)) {
-              fs.mkdirSync(uploadPath, { recursive: true });
-            }
-            cb(null, uploadPath);
-          },
-          filename: (req, file, cb) => {
-            const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1e9);
-            const ext = extname(file.originalname);
-            cb(null, `payment-${uniqueSuffix}${ext}`);
-          },
-        }),
-        limits: { fileSize: 10 * 1024 * 1024 },
-        fileFilter: (req, file, cb) => {
-          const allowed = ['application/pdf', 'image/jpeg', 'image/jpg', 'image/png'];
-          if (allowed.includes(file.mimetype)) cb(null, true);
-          else cb(new Error('Supporting document must be PDF, JPG, JPEG or PNG.'), false);
+    AnyFilesInterceptor({
+      storage: diskStorage({
+        destination: (req, file, cb) => {
+          const companyId = (req as any).user?.userId;
+          const uploadPath = join(process.cwd(), 'uploads', 'company', companyId || 'unknown');
+          if (!fs.existsSync(uploadPath)) {
+            fs.mkdirSync(uploadPath, { recursive: true });
+          }
+          cb(null, uploadPath);
         },
+        filename: (req, file, cb) => {
+          const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1e9);
+          const ext = extname(file.originalname);
+          cb(null, `payment-${uniqueSuffix}${ext}`);
+        },
+      }),
+      limits: { fileSize: 10 * 1024 * 1024 },
+      fileFilter: (req, file, cb) => {
+        const allowed = ['application/pdf', 'image/jpeg', 'image/jpg', 'image/png'];
+        if (allowed.includes(file.mimetype)) cb(null, true);
+        else cb(new Error('Supporting document must be PDF, JPG, JPEG or PNG.'), false);
       },
-    ),
+    }),
   )
   async submitPaymentTaxLegacy(
     @Request() req,
     @Param('projectId') projectId: string,
     @Param('invoiceId') invoiceId: string,
     @Body() body: any,
-    @UploadedFiles()
-    files: {
-      supporting_document?: Express.Multer.File[];
-      supportingdocument?: Express.Multer.File[];
-      supportingDocument?: Express.Multer.File[];
-      supporting_doc?: Express.Multer.File[];
-    },
+    @UploadedFiles() files: Express.Multer.File[],
   ): Promise<any> {
     const { dto, supportingDoc } = this.mapFinancePaymentPayload(body, files);
     return this.companyProjectsService.submitPayment(
@@ -2224,58 +2208,39 @@ export class CompanyProjectsController {
   @UseGuards(JwtAuthGuard, AccountStatusGuard)
   @UsePipes(new ValidationPipe({ transform: true, whitelist: true }))
   @UseInterceptors(
-    FileFieldsInterceptor(
-      [
-        { name: 'supporting_document', maxCount: 1 },
-        { name: 'supportingdocument', maxCount: 1 },
-        { name: 'supportingDocument', maxCount: 1 },
-        { name: 'supporting_doc', maxCount: 1 },
-      ],
-      {
-        storage: diskStorage({
-          destination: (req, file, cb) => {
-            const companyId = (req as any).user?.userId;
-            const uploadPath = join(process.cwd(), 'uploads', 'company', companyId || 'unknown');
-            if (!fs.existsSync(uploadPath)) {
-              fs.mkdirSync(uploadPath, { recursive: true });
-            }
-            cb(null, uploadPath);
-          },
-          filename: (req, file, cb) => {
-            const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1e9);
-            const ext = extname(file.originalname);
-            cb(null, `payment-${uniqueSuffix}${ext}`);
-          },
-        }),
-        limits: { fileSize: 10 * 1024 * 1024 },
-        fileFilter: (req, file, cb) => {
-          const allowed = [
-            'application/pdf',
-            'image/jpeg',
-            'image/jpg',
-            'image/png',
-          ];
-          if (allowed.includes(file.mimetype)) {
-            cb(null, true);
-          } else {
-            cb(new Error('Supporting document must be PDF, JPG, JPEG or PNG.'), false);
+    AnyFilesInterceptor({
+      storage: diskStorage({
+        destination: (req, file, cb) => {
+          const companyId = (req as any).user?.userId;
+          const uploadPath = join(process.cwd(), 'uploads', 'company', companyId || 'unknown');
+          if (!fs.existsSync(uploadPath)) {
+            fs.mkdirSync(uploadPath, { recursive: true });
           }
+          cb(null, uploadPath);
         },
+        filename: (req, file, cb) => {
+          const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1e9);
+          const ext = extname(file.originalname);
+          cb(null, `payment-${uniqueSuffix}${ext}`);
+        },
+      }),
+      limits: { fileSize: 10 * 1024 * 1024 },
+      fileFilter: (req, file, cb) => {
+        const allowed = ['application/pdf', 'image/jpeg', 'image/jpg', 'image/png'];
+        if (allowed.includes(file.mimetype)) {
+          cb(null, true);
+        } else {
+          cb(new Error('Supporting document must be PDF, JPG, JPEG or PNG.'), false);
+        }
       },
-    ),
+    }),
   )
   async submitPaymentFinanceV2Proforma(
     @Request() req,
     @Param('projectId') projectId: string,
     @Param('invoiceId') invoiceId: string,
     @Body() body: any,
-    @UploadedFiles()
-    files: {
-      supporting_document?: Express.Multer.File[];
-      supportingdocument?: Express.Multer.File[];
-      supportingDocument?: Express.Multer.File[];
-      supporting_doc?: Express.Multer.File[];
-    },
+    @UploadedFiles() files: Express.Multer.File[],
   ): Promise<any> {
     const { dto, supportingDoc } = this.mapFinancePaymentPayload(body, files);
     return this.companyProjectsService.submitPayment(
@@ -2295,58 +2260,39 @@ export class CompanyProjectsController {
   @UseGuards(JwtAuthGuard, AccountStatusGuard)
   @UsePipes(new ValidationPipe({ transform: true, whitelist: true }))
   @UseInterceptors(
-    FileFieldsInterceptor(
-      [
-        { name: 'supporting_document', maxCount: 1 },
-        { name: 'supportingdocument', maxCount: 1 },
-        { name: 'supportingDocument', maxCount: 1 },
-        { name: 'supporting_doc', maxCount: 1 },
-      ],
-      {
-        storage: diskStorage({
-          destination: (req, file, cb) => {
-            const companyId = (req as any).user?.userId;
-            const uploadPath = join(process.cwd(), 'uploads', 'company', companyId || 'unknown');
-            if (!fs.existsSync(uploadPath)) {
-              fs.mkdirSync(uploadPath, { recursive: true });
-            }
-            cb(null, uploadPath);
-          },
-          filename: (req, file, cb) => {
-            const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1e9);
-            const ext = extname(file.originalname);
-            cb(null, `payment-${uniqueSuffix}${ext}`);
-          },
-        }),
-        limits: { fileSize: 10 * 1024 * 1024 },
-        fileFilter: (req, file, cb) => {
-          const allowed = [
-            'application/pdf',
-            'image/jpeg',
-            'image/jpg',
-            'image/png',
-          ];
-          if (allowed.includes(file.mimetype)) {
-            cb(null, true);
-          } else {
-            cb(new Error('Supporting document must be PDF, JPG, JPEG or PNG.'), false);
+    AnyFilesInterceptor({
+      storage: diskStorage({
+        destination: (req, file, cb) => {
+          const companyId = (req as any).user?.userId;
+          const uploadPath = join(process.cwd(), 'uploads', 'company', companyId || 'unknown');
+          if (!fs.existsSync(uploadPath)) {
+            fs.mkdirSync(uploadPath, { recursive: true });
           }
+          cb(null, uploadPath);
         },
+        filename: (req, file, cb) => {
+          const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1e9);
+          const ext = extname(file.originalname);
+          cb(null, `payment-${uniqueSuffix}${ext}`);
+        },
+      }),
+      limits: { fileSize: 10 * 1024 * 1024 },
+      fileFilter: (req, file, cb) => {
+        const allowed = ['application/pdf', 'image/jpeg', 'image/jpg', 'image/png'];
+        if (allowed.includes(file.mimetype)) {
+          cb(null, true);
+        } else {
+          cb(new Error('Supporting document must be PDF, JPG, JPEG or PNG.'), false);
+        }
       },
-    ),
+    }),
   )
   async submitPaymentFinanceV2Tax(
     @Request() req,
     @Param('projectId') projectId: string,
     @Param('invoiceId') invoiceId: string,
     @Body() body: any,
-    @UploadedFiles()
-    files: {
-      supporting_document?: Express.Multer.File[];
-      supportingdocument?: Express.Multer.File[];
-      supportingDocument?: Express.Multer.File[];
-      supporting_doc?: Express.Multer.File[];
-    },
+    @UploadedFiles() files: Express.Multer.File[],
   ): Promise<any> {
     const { dto, supportingDoc } = this.mapFinancePaymentPayload(body, files);
     return this.companyProjectsService.submitPayment(
@@ -2367,63 +2313,45 @@ export class CompanyProjectsController {
   @UseGuards(JwtAuthGuard, AccountStatusGuard)
   @UsePipes(new ValidationPipe({ transform: true, whitelist: true }))
   @UseInterceptors(
-    FileFieldsInterceptor(
-      [
-        { name: 'supporting_document', maxCount: 1 },
-        { name: 'supportingdocument', maxCount: 1 },
-        { name: 'supportingDocument', maxCount: 1 },
-        { name: 'supporting_doc', maxCount: 1 },
-      ],
-      {
-        storage: diskStorage({
-          destination: (req, file, cb) => {
-            const companyId = (req as any).user?.userId;
-            const uploadPath = join(process.cwd(), 'uploads', 'company', companyId || 'unknown');
-            if (!fs.existsSync(uploadPath)) {
-              fs.mkdirSync(uploadPath, { recursive: true });
-            }
-            cb(null, uploadPath);
-          },
-          filename: (req, file, cb) => {
-            const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1e9);
-            const ext = extname(file.originalname);
-            cb(null, `payment-${uniqueSuffix}${ext}`);
-          },
-        }),
-        limits: { fileSize: 10 * 1024 * 1024 },
-        fileFilter: (req, file, cb) => {
-          const allowed = [
-            'application/pdf',
-            'image/jpeg',
-            'image/jpg',
-            'image/png',
-          ];
-          if (allowed.includes(file.mimetype)) {
-            cb(null, true);
-          } else {
-            cb(new Error('Supporting document must be PDF, JPG, JPEG or PNG.'), false);
+    AnyFilesInterceptor({
+      storage: diskStorage({
+        destination: (req, file, cb) => {
+          const companyId = (req as any).user?.userId;
+          const uploadPath = join(process.cwd(), 'uploads', 'company', companyId || 'unknown');
+          if (!fs.existsSync(uploadPath)) {
+            fs.mkdirSync(uploadPath, { recursive: true });
           }
+          cb(null, uploadPath);
         },
+        filename: (req, file, cb) => {
+          const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1e9);
+          const ext = extname(file.originalname);
+          cb(null, `payment-${uniqueSuffix}${ext}`);
+        },
+      }),
+      limits: { fileSize: 10 * 1024 * 1024 },
+      fileFilter: (req, file, cb) => {
+        const allowed = ['application/pdf', 'image/jpeg', 'image/jpg', 'image/png'];
+        if (allowed.includes(file.mimetype)) {
+          cb(null, true);
+        } else {
+          cb(new Error('Supporting document must be PDF, JPG, JPEG or PNG.'), false);
+        }
       },
-    ),
+    }),
   )
   async submitFinancePayment(
     @Request() req,
     @Param('projectId') projectId: string,
     @Body() dto: SubmitFinancePaymentDto,
-    @UploadedFiles()
-    files: {
-      supporting_document?: Express.Multer.File[];
-      supportingdocument?: Express.Multer.File[];
-      supportingDocument?: Express.Multer.File[];
-      supporting_doc?: Express.Multer.File[];
-    },
+    @UploadedFiles() files: Express.Multer.File[],
   ): Promise<any> {
     const supportingDoc =
-      files?.supporting_document?.[0] ??
-      files?.supportingdocument?.[0] ??
-      files?.supportingDocument?.[0] ??
-      files?.supporting_doc?.[0];
+      files?.find((f) =>
+        ['supporting_document', 'supportingdocument', 'supportingDocument', 'supporting_doc', 'supporting_document[]', 'supportingdocument[]', 'file'].includes(
+          String((f as any)?.fieldname || ''),
+        ),
+      ) ?? files?.[0];
     return this.companyProjectsService.submitFinancePayment(
       req.user.userId,
       projectId,
@@ -2438,7 +2366,6 @@ export class CompanyProjectsController {
    * Body: { "approval_status": 0 | 1 | 2 | 3 } — 0=Pending, 1=Approved, 2=Rejected, 3=Under Review
    */
   @Patch(':projectId/invoices/:invoiceId/approval')
-  @UseGuards(JwtAuthGuard, AccountStatusGuard)
   async updateInvoiceApproval(
     @Request() req,
     @Param('projectId') projectId: string,
@@ -2457,7 +2384,6 @@ export class CompanyProjectsController {
   }
 
   @Patch(':projectId/proforma-invoices/:invoiceId/approval')
-  @UseGuards(JwtAuthGuard, AccountStatusGuard)
   async updateProformaInvoiceApproval(
     @Request() req,
     @Param('projectId') projectId: string,
@@ -2476,7 +2402,6 @@ export class CompanyProjectsController {
   }
 
   @Patch(':projectId/tax-invoices/:invoiceId/approval')
-  @UseGuards(JwtAuthGuard, AccountStatusGuard)
   async updateTaxInvoiceApproval(
     @Request() req,
     @Param('projectId') projectId: string,
@@ -2498,7 +2423,6 @@ export class CompanyProjectsController {
   @Patch(':projectId/finance-v2/tax-invoices/:invoiceId/approval')
   @Patch(':projectId/finance/v2/proforma-invoices/:invoiceId/approval')
   @Patch(':projectId/finance/v2/tax-invoices/:invoiceId/approval')
-  @UseGuards(JwtAuthGuard, AccountStatusGuard)
   async updateFinanceV2InvoiceApproval(
     @Request() req,
     @Param('projectId') projectId: string,
