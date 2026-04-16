@@ -6079,6 +6079,63 @@ export class CompanyProjectsService {
     }
     Object.assign(primary_data_rows, eeRowsCalculated);
 
+    // Keep response sources aligned for EE calculated rows:
+    // saved_by_info_type.ee / saved_by_data_id must reflect the same calculated values as primary_data_rows.ee.
+    const normalizedSavedByDataId: Record<string, any> = { ...savedByDataId };
+    const normalizedByInfoType: Record<string, any[]> = { ...byInfoType };
+    if (Array.isArray(primary_data_rows.ee)) {
+      const eeSourceRows = Array.isArray(normalizedByInfoType.ee) ? [...normalizedByInfoType.ee] : [];
+      const eeByDataId = new Map<string, any>();
+      const eeByOrder = new Map<number, any>();
+      const rowKey = (row: any): string => {
+        const d = row?.data_id;
+        if (d != null && String(d).trim()) return String(d);
+        const m = row?._id;
+        if (m != null && String(m).trim()) return String(m);
+        return '';
+      };
+
+      for (const row of eeSourceRows) {
+        const rid = rowKey(row);
+        if (rid) eeByDataId.set(rid, row);
+        const order = Number(row?.checklist_order);
+        if (Number.isFinite(order)) eeByOrder.set(order, row);
+      }
+
+      for (const row of primary_data_rows.ee) {
+        const order = Number(row?.checklist_order);
+        if (!eeCalculatedOrderSet.has(order)) continue;
+        const rid = rowKey(row);
+
+        if (rid) {
+          const prev = eeByDataId.get(rid) || normalizedSavedByDataId[rid] || {};
+          const merged = { ...prev, ...row };
+          eeByDataId.set(rid, merged);
+          normalizedSavedByDataId[rid] = merged;
+        } else if (Number.isFinite(order)) {
+          const prev = eeByOrder.get(order) || {};
+          eeByOrder.set(order, { ...prev, ...row });
+        }
+      }
+
+      const dedup = new Map<string, any>();
+      for (const row of eeByDataId.values()) {
+        const rid = rowKey(row);
+        if (!rid) continue;
+        dedup.set(rid, row);
+      }
+      for (const row of eeByOrder.values()) {
+        const rid = rowKey(row);
+        if (rid && dedup.has(rid)) continue;
+        // fallback key when data_id is absent
+        const key = rid || `order_${Number(row?.checklist_order ?? 0)}`;
+        dedup.set(key, row);
+      }
+      normalizedByInfoType.ee = Array.from(dedup.values()).sort(
+        (a, b) => Number(a?.checklist_order || 0) - Number(b?.checklist_order || 0),
+      );
+    }
+
     // Compute WC in-place by checklist_order (17 inputs -> 18,19,25,102 calculated).
     const { rows: wcRowsCalculated, issues: wcCalculationIssues } = applyWcCalculationsByOrder(primary_data_rows);
     const wcCalculatedOrderSet = new Set<number>(WC_CALCULATED_CHECKLIST_ORDERS as unknown as number[]);
@@ -6111,8 +6168,8 @@ export class CompanyProjectsService {
       data: {
         project_id: projectId,
         master_primary_data: masterList,
-        saved_by_info_type: byInfoType,
-        saved_by_data_id: savedByDataId,
+        saved_by_info_type: normalizedByInfoType,
+        saved_by_data_id: normalizedSavedByDataId,
         primary_data_rows,
         final_submit_docs: finalSubmitCount,
         primary_data_approval_count: approvalCount,
@@ -6136,15 +6193,60 @@ export class CompanyProjectsService {
     payload: any,
     finalSubmit?: boolean,
   ) {
-    let doc: any[] = [];
-    if (Array.isArray(payload)) {
-      doc = payload;
-    } else if (payload && typeof payload === 'object') {
-      const mongoose = require('mongoose');
-      const infoType = formType && String(formType).trim() ? formType : 'gi';
-      const masterRows = await this.masterPrimaryDataChecklistModel
+    const infoType = formType && String(formType).trim() ? String(formType).trim() : 'gi';
+    let masterRowsCache: any[] | null = null;
+    const getMasterRows = async () => {
+      if (masterRowsCache) return masterRowsCache;
+      masterRowsCache = await this.masterPrimaryDataChecklistModel
         .find({ info_type: infoType, is_active: 1 })
         .lean();
+      return masterRowsCache;
+    };
+
+    const normalizeIncomingDataId = async (row: any): Promise<string | undefined> => {
+      const masterRows = await getMasterRows();
+      const byMasterId = new Set<string>(
+        masterRows.map((m: any) => m?._id?.toString?.() ?? String(m?._id ?? '')).filter(Boolean),
+      );
+      const byOrder = new Map<number, string>();
+      const byParam = new Map<string, string>();
+      for (const m of masterRows as any[]) {
+        const mid = m?._id?.toString?.() ?? String(m?._id ?? '');
+        const order = Number(m?.checklist_order);
+        if (Number.isFinite(order)) byOrder.set(order, mid);
+        const p = this.normalizeText(m?.parameter);
+        if (p) byParam.set(p, mid);
+      }
+
+      const rawId = row?.data_id?.toString?.() ?? String(row?.data_id ?? '');
+      if (rawId && byMasterId.has(rawId)) return rawId;
+      const idNum = Number(rawId);
+      if (Number.isFinite(idNum) && byOrder.has(idNum)) return byOrder.get(idNum);
+
+      const rowOrder = Number(row?.checklist_order);
+      if (Number.isFinite(rowOrder) && byOrder.has(rowOrder)) return byOrder.get(rowOrder);
+
+      const pKey = this.normalizeText(row?.parameter);
+      if (pKey && byParam.has(pKey)) return byParam.get(pKey);
+      return undefined;
+    };
+
+    let doc: any[] = [];
+    if (Array.isArray(payload)) {
+      const normalized: any[] = [];
+      for (const row of payload) {
+        if (!row || typeof row !== 'object') continue;
+        const resolvedDataId = await normalizeIncomingDataId(row);
+        normalized.push({
+          ...row,
+          data_id: resolvedDataId ?? row?.data_id,
+          info_type: row?.info_type ?? infoType,
+        });
+      }
+      doc = normalized;
+    } else if (payload && typeof payload === 'object') {
+      const mongoose = require('mongoose');
+      const masterRows = await getMasterRows();
       for (const row of masterRows as any[]) {
         const dataId = row._id.toString();
         const checklistOrderKey = String(row?.checklist_order ?? '');
@@ -6421,112 +6523,62 @@ export class CompanyProjectsService {
     }
     this.assertEeInputs(electricalRow);
     this.assertEeThermalInputs(thermalRow);
+    const periods: Array<'fy1' | 'fy2' | 'fy3' | 'fy4' | 'exp'> = ['fy1', 'fy2', 'fy3', 'fy4', 'exp'];
+    const thermalUnit = thermalRow?.reference_unit || thermalRow?.details;
 
-    const electrical = this.getFyValues(electricalRow || {});
-    const thermal = this.getFyValues(thermalRow || {});
+    for (const p of periods) {
+      const e = this.yearNumber(electricalRow, p);
+      const t = this.yearNumber(thermalRow, p);
+      const tk = this.thermalToKwh(thermalUnit, t);
+      const total = e + tk;
+      const gi = p === 'exp'
+        ? this.toFiniteNumber((equivalentProduct as any).fy5, 0)
+        : this.toFiniteNumber((equivalentProduct as any)[p], 0);
 
-    const thermalInKwh: Record<'fy1' | 'fy2' | 'fy3' | 'fy4' | 'fy5', number> = {
-      fy1: 0,
-      fy2: 0,
-      fy3: 0,
-      fy4: 0,
-      fy5: 0,
-    };
-    const totalEnergyKwh: Record<'fy1' | 'fy2' | 'fy3' | 'fy4' | 'fy5', number> = {
-      fy1: 0,
-      fy2: 0,
-      fy3: 0,
-      fy4: 0,
-      fy5: 0,
-    };
-    const shareElectrical: Record<'fy1' | 'fy2' | 'fy3' | 'fy4' | 'fy5', number> = {
-      fy1: 0,
-      fy2: 0,
-      fy3: 0,
-      fy4: 0,
-      fy5: 0,
-    };
-    const shareThermal: Record<'fy1' | 'fy2' | 'fy3' | 'fy4' | 'fy5', number> = {
-      fy1: 0,
-      fy2: 0,
-      fy3: 0,
-      fy4: 0,
-      fy5: 0,
-    };
-    const specificElectrical: Record<'fy1' | 'fy2' | 'fy3' | 'fy4' | 'fy5', number> = {
-      fy1: 0,
-      fy2: 0,
-      fy3: 0,
-      fy4: 0,
-      fy5: 0,
-    };
-    const specificThermal: Record<'fy1' | 'fy2' | 'fy3' | 'fy4' | 'fy5', number> = {
-      fy1: 0,
-      fy2: 0,
-      fy3: 0,
-      fy4: 0,
-      fy5: 0,
-    };
-    const specificTotalKwh: Record<'fy1' | 'fy2' | 'fy3' | 'fy4' | 'fy5', number> = {
-      fy1: 0,
-      fy2: 0,
-      fy3: 0,
-      fy4: 0,
-      fy5: 0,
-    };
-    const specificTotalGj: Record<'fy1' | 'fy2' | 'fy3' | 'fy4' | 'fy5', number> = {
-      fy1: 0,
-      fy2: 0,
-      fy3: 0,
-      fy4: 0,
-      fy5: 0,
-    };
-    const reductionSpecific: Record<'fy1' | 'fy2' | 'fy3' | 'fy4' | 'fy5', number> = {
-      fy1: 0,
-      fy2: 0,
-      fy3: 0,
-      fy4: 0,
-      fy5: 0,
-    };
-
-    for (const fy of this.EE_FY_KEYS) {
-      thermalInKwh[fy] = this.thermalToKwh(thermalRow?.reference_unit, thermal[fy]);
-      totalEnergyKwh[fy] = electrical[fy] + thermalInKwh[fy];
-      shareElectrical[fy] = totalEnergyKwh[fy] > 0 ? (electrical[fy] / totalEnergyKwh[fy]) * 100 : 0;
-      shareThermal[fy] = totalEnergyKwh[fy] > 0 ? (thermalInKwh[fy] / totalEnergyKwh[fy]) * 100 : 0;
-
-      const equivalent = this.toFiniteNumber(equivalentProduct[fy], 0);
-      specificElectrical[fy] = equivalent > 0 ? electrical[fy] / equivalent : 0;
-      specificThermal[fy] = equivalent > 0 ? thermalInKwh[fy] / equivalent : 0;
-      specificTotalKwh[fy] = equivalent > 0 ? totalEnergyKwh[fy] / equivalent : 0;
-      specificTotalGj[fy] = specificTotalKwh[fy] / 277.778;
+      if (thermalKwhRow) this.setYear(thermalKwhRow, p, this.roundTo(tk));
+      if (totalEnergyRow) this.setYear(totalEnergyRow, p, this.roundTo(total));
+      if (shareElectricalRow) this.setYear(shareElectricalRow, p, total > 0 ? this.roundTo((e / total) * 100) : 0);
+      if (shareThermalRow) this.setYear(shareThermalRow, p, total > 0 ? this.roundTo((tk / total) * 100) : 0);
+      if (specificElectricalRow) this.setYear(specificElectricalRow, p, gi > 0 ? this.roundTo(e / gi) : 0);
+      if (specificThermalRow) this.setYear(specificThermalRow, p, gi > 0 ? this.roundTo(tk / gi) : 0);
+      if (specificTotalKwhRow) this.setYear(specificTotalKwhRow, p, gi > 0 ? this.roundTo(total / gi) : 0);
+      if (specificTotalGjRow) this.setYear(specificTotalGjRow, p, gi > 0 ? this.roundTo((total / gi) / 277.778) : 0);
     }
 
-    // Year-over-year reduction; extrapolated compares FY4 to FY5.
-    reductionSpecific.fy1 = 0;
-    reductionSpecific.fy2 = specificTotalKwh.fy1 > 0
-      ? ((specificTotalKwh.fy1 - specificTotalKwh.fy2) / specificTotalKwh.fy1) * 100
-      : 0;
-    reductionSpecific.fy3 = specificTotalKwh.fy2 > 0
-      ? ((specificTotalKwh.fy2 - specificTotalKwh.fy3) / specificTotalKwh.fy2) * 100
-      : 0;
-    reductionSpecific.fy4 = specificTotalKwh.fy3 > 0
-      ? ((specificTotalKwh.fy3 - specificTotalKwh.fy4) / specificTotalKwh.fy3) * 100
-      : 0;
-    reductionSpecific.fy5 = specificTotalKwh.fy4 > 0
-      ? ((specificTotalKwh.fy4 - specificTotalKwh.fy5) / specificTotalKwh.fy4) * 100
-      : 0;
+    if (reductionRow && specificTotalKwhRow) {
+      // Persist numeric baseline for fy1; UI can render N/A in GET if needed.
+      reductionRow.fy1 = 0;
+      const r14fy1 = this.yearNumber(specificTotalKwhRow, 'fy1');
+      const r14fy2 = this.yearNumber(specificTotalKwhRow, 'fy2');
+      const r14fy3 = this.yearNumber(specificTotalKwhRow, 'fy3');
+      const r14fy4 = this.yearNumber(specificTotalKwhRow, 'fy4');
+      const r14Exp = this.yearNumber(specificTotalKwhRow, 'exp');
+      reductionRow.fy2 = r14fy1 > 0 ? this.roundTo(((r14fy1 - r14fy2) / r14fy1) * 100) : 0;
+      reductionRow.fy3 = r14fy2 > 0 ? this.roundTo(((r14fy2 - r14fy3) / r14fy2) * 100) : 0;
+      reductionRow.fy4 = r14fy3 > 0 ? this.roundTo(((r14fy3 - r14fy4) / r14fy3) * 100) : 0;
+      this.setYear(reductionRow, 'exp', r14fy4 > 0 ? this.roundTo(((r14fy4 - r14Exp) / r14fy4) * 100) : 0);
+    }
 
-    if (thermalKwhRow) this.setFyValues(thermalKwhRow, thermalInKwh);
-    if (totalEnergyRow) this.setFyValues(totalEnergyRow, totalEnergyKwh);
-    if (shareElectricalRow) this.setFyValues(shareElectricalRow, shareElectrical);
-    if (shareThermalRow) this.setFyValues(shareThermalRow, shareThermal);
-    if (specificElectricalRow) this.setFyValues(specificElectricalRow, specificElectrical);
-    if (specificThermalRow) this.setFyValues(specificThermalRow, specificThermal);
-    if (specificTotalKwhRow) this.setFyValues(specificTotalKwhRow, specificTotalKwh);
-    if (specificTotalGjRow) this.setFyValues(specificTotalGjRow, specificTotalGj);
-    if (reductionRow) this.setFyValues(reductionRow, reductionSpecific);
-    if (reductionRow142) this.setFyValues(reductionRow142, reductionSpecific);
+    if (reductionRow142 && specificTotalGjRow) {
+      reductionRow142.fy1 = 0;
+      reductionRow142.fy2 = 0;
+      reductionRow142.fy3 = 0;
+      const r15fy1 = this.yearNumber(specificTotalGjRow, 'fy1');
+      const r15fy4 = this.yearNumber(specificTotalGjRow, 'fy4');
+      reductionRow142.fy4 = r15fy1 > 0 ? this.roundTo(((r15fy1 - r15fy4) / r15fy1) * 100) : 0;
+      this.setYear(reductionRow142, 'exp', 0);
+    }
+
+    if (thermalKwhRow) thermalKwhRow.reference_unit = 'kWh';
+    if (totalEnergyRow) totalEnergyRow.reference_unit = 'kWh';
+    if (shareElectricalRow) shareElectricalRow.reference_unit = '%';
+    if (shareThermalRow) shareThermalRow.reference_unit = '%';
+    if (specificElectricalRow) specificElectricalRow.reference_unit = 'kWh/unit';
+    if (specificThermalRow) specificThermalRow.reference_unit = 'kWh/unit';
+    if (specificTotalKwhRow) specificTotalKwhRow.reference_unit = 'kWh/unit';
+    if (specificTotalGjRow) specificTotalGjRow.reference_unit = 'GJ/unit';
+    if (reductionRow) reductionRow.reference_unit = '%';
+    if (reductionRow142) reductionRow142.reference_unit = '%';
   }
 
   private async prepareEePayloadForSave(companyId: string, projectId: string, incomingDoc: any[]): Promise<any[]> {
