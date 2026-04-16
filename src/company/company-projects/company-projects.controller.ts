@@ -1694,12 +1694,15 @@ export class CompanyProjectsController {
    * GET /api/company/projects/:projectId/primary-data
    */
   @Get(':projectId/primary-data')
-  @UseGuards(JwtAuthGuard, AccountStatusGuard)
   async getPrimaryData(
     @Request() req,
     @Param('projectId') projectId: string,
   ): Promise<any> {
-    return this.companyProjectsService.getPrimaryData(req.user.userId, projectId);
+    const companyId = req?.user?.userId;
+    if (companyId) {
+      return this.companyProjectsService.getPrimaryData(companyId, projectId);
+    }
+    return this.companyProjectsService.getPrimaryDataForAdmin(projectId);
   }
 
   /**

@@ -256,8 +256,9 @@ export function applyEeCalculationsByOrder(
     if (r11) r11[y] = total > 0 ? roundTo((tk * 100) / total) : 0;
     if (r12) r12[y] = e && d ? roundTo(e / d) : 0;
 
-    // Consistent thermal basis: converted thermal kWh / denominator for all FYs.
-    if (r13) r13[y] = tk && d ? roundTo(tk / d) : 0;
+    // Legacy behavior: fy1 uses converted thermal (kWh), later periods use raw thermal input basis.
+    const thermalSpecificBase = y === 'fy1' ? tk : t;
+    if (r13) r13[y] = thermalSpecificBase && d ? roundTo(thermalSpecificBase / d) : 0;
 
     if (r14) r14[y] = total && d ? roundTo(total / d) : 0;
     if (r15) r15[y] = total && d ? roundTo((total / d) / 277.778) : 0;

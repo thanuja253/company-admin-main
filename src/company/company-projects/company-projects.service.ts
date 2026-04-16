@@ -6016,12 +6016,26 @@ export class CompanyProjectsService {
       this.getSectionsFromMaster(),
     ]);
 
+    const masterMetaById = new Map<string, { info_type: string }>();
+    for (const m of masterList as any[]) {
+      const id = m?._id?.toString?.() ?? String(m?._id ?? '');
+      if (!id) continue;
+      masterMetaById.set(id, { info_type: String(m?.info_type || '') });
+    }
+    const validSavedRows = (savedRows as any[]).filter((row) => {
+      const id = row?.data_id?.toString?.() ?? String(row?.data_id ?? '');
+      if (!id) return false;
+      const meta = masterMetaById.get(id);
+      if (!meta) return false;
+      return String(row?.info_type || '') === String(meta.info_type || '');
+    });
+
     const infoTypesFromMaster = [...new Set((masterList as any[]).map((r) => r.info_type).filter(Boolean))];
     const byInfoType: Record<string, any[]> = {};
     for (const t of infoTypesFromMaster) {
       byInfoType[t] = [];
     }
-    const latestMap = latestByDataId(savedRows as any[]);
+    const latestMap = latestByDataId(validSavedRows as any[]);
     for (const row of Array.from(latestMap.values()) as any[]) {
       const t = row.info_type || 'gi';
       if (!byInfoType[t]) byInfoType[t] = [];
@@ -6029,8 +6043,8 @@ export class CompanyProjectsService {
     }
     const savedByDataId = Object.fromEntries(Array.from(latestMap.entries()));
 
-    const finalSubmitCount = (savedRows as any[]).filter((r) => r.final_submit === 1).length;
-    const approvalCount = (savedRows as any[]).filter((r) => r.document_status === PRIMARY_DATA_DOC_STATUS.ACCEPTED).length;
+    const finalSubmitCount = (validSavedRows as any[]).filter((r) => r.final_submit === 1).length;
+    const approvalCount = (validSavedRows as any[]).filter((r) => r.document_status === PRIMARY_DATA_DOC_STATUS.ACCEPTED).length;
 
     // Merged rows: for each master row, attach saved values so Reference Unit (and FY) come from saved when present.
     // primary_data_rows is keyed by info_type (gi, ee, wc, ...) so the UI can use primary_data_rows[activeSection].
@@ -6182,6 +6196,13 @@ export class CompanyProjectsService {
     };
   }
 
+  /** Admin wrapper for primary-data; route param may be project id or company id. */
+  async getPrimaryDataForAdmin(projectIdOrCompanyId: string) {
+    const { companyId, resolvedProjectId } =
+      await this.resolveRegistrationIdsForAdminParam(projectIdOrCompanyId);
+    return this.getPrimaryData(companyId, resolvedProjectId);
+  }
+
   /**
    * Save Primary Data by section (form_type + payload). Maps section payload to doc array and upserts.
    * Payload can be: (1) doc array, or (2) object keyed by data_id with { fy1, fy2, fy3, fy4, extrapolated, lt_target, reference_unit, details, ... }.
@@ -6237,10 +6258,16 @@ export class CompanyProjectsService {
       for (const row of payload) {
         if (!row || typeof row !== 'object') continue;
         const resolvedDataId = await normalizeIncomingDataId(row);
+        if (!resolvedDataId) {
+          throw new BadRequestException({
+            status: 'error',
+            message: `Invalid ${infoType.toUpperCase()} payload row: unable to map data_id/checklist_order to master row.`,
+          });
+        }
         normalized.push({
           ...row,
-          data_id: resolvedDataId ?? row?.data_id,
-          info_type: row?.info_type ?? infoType,
+          data_id: resolvedDataId,
+          info_type: infoType,
         });
       }
       doc = normalized;
@@ -6373,17 +6400,6 @@ export class CompanyProjectsService {
   ): Promise<Record<'fy1' | 'fy2' | 'fy3' | 'fy4' | 'fy5', number>> {
     const mongoose = require('mongoose');
     const pId = new mongoose.Types.ObjectId(projectId);
-    const giRow = await this.primaryDataFormModel
-      .findOne({
-        company_id: companyId,
-        project_id: pId,
-        info_type: 'gi',
-        parameter: { $regex: /equivalent\s*product/i },
-      })
-      .lean();
-
-    if (giRow) return this.getFyValues(giRow);
-
     const giMasterRow = await this.masterPrimaryDataChecklistModel
       .findOne({ info_type: 'gi', checklist_order: 4, is_active: 1 })
       .lean();
@@ -6393,14 +6409,31 @@ export class CompanyProjectsService {
     }
 
     const giByOrderRow = await this.primaryDataFormModel
+      .find({
+        company_id: companyId,
+        project_id: pId,
+        info_type: 'gi',
+        data_id: giMasterRow._id,
+      })
+      .sort({ updatedAt: -1, createdAt: -1 })
+      .limit(1)
+      .lean();
+
+    if (Array.isArray(giByOrderRow) && giByOrderRow.length > 0) {
+      return this.getFyValues(giByOrderRow[0]);
+    }
+
+    // Fallback only when legacy data was stored without checklist-order mapping.
+    const legacyGiRow = await this.primaryDataFormModel
       .findOne({
         company_id: companyId,
         project_id: pId,
-        data_id: giMasterRow._id,
+        info_type: 'gi',
+        parameter: { $regex: /equivalent\s*product/i },
       })
+      .sort({ updatedAt: -1, createdAt: -1 })
       .lean();
-
-    return this.getFyValues(giByOrderRow || {});
+    return this.getFyValues(legacyGiRow || {});
   }
 
   private assertEeInputs(eeRow6: any | undefined) {
@@ -6540,7 +6573,9 @@ export class CompanyProjectsService {
       if (shareElectricalRow) this.setYear(shareElectricalRow, p, total > 0 ? this.roundTo((e / total) * 100) : 0);
       if (shareThermalRow) this.setYear(shareThermalRow, p, total > 0 ? this.roundTo((tk / total) * 100) : 0);
       if (specificElectricalRow) this.setYear(specificElectricalRow, p, gi > 0 ? this.roundTo(e / gi) : 0);
-      if (specificThermalRow) this.setYear(specificThermalRow, p, gi > 0 ? this.roundTo(tk / gi) : 0);
+      // Legacy behavior parity: fy1 uses converted thermal, later periods use raw thermal value.
+      const thermalSpecificBase = p === 'fy1' ? tk : t;
+      if (specificThermalRow) this.setYear(specificThermalRow, p, gi > 0 ? this.roundTo(thermalSpecificBase / gi) : 0);
       if (specificTotalKwhRow) this.setYear(specificTotalKwhRow, p, gi > 0 ? this.roundTo(total / gi) : 0);
       if (specificTotalGjRow) this.setYear(specificTotalGjRow, p, gi > 0 ? this.roundTo((total / gi) / 277.778) : 0);
     }
@@ -7031,12 +7066,38 @@ export class CompanyProjectsService {
           additional_details: sectionRow?.additional_details,
         }));
 
+    const infoTypes = [...new Set(items.map((x) => String(x?.info_type || 'gi')))];
+    const masterRows = await this.masterPrimaryDataChecklistModel
+      .find({ is_active: 1, info_type: { $in: infoTypes } })
+      .select('_id info_type')
+      .lean();
+    const masterIdByInfoType = new Map<string, Set<string>>();
+    for (const row of masterRows as any[]) {
+      const t = String(row?.info_type || '');
+      if (!masterIdByInfoType.has(t)) masterIdByInfoType.set(t, new Set<string>());
+      masterIdByInfoType.get(t)!.add(row?._id?.toString?.() ?? String(row?._id ?? ''));
+    }
+
     for (const item of items) {
-      const dataId = item.data_id ? new mongoose.Types.ObjectId(item.data_id) : undefined;
-      if (!dataId) continue;
+      const infoType = String(item.info_type || 'gi');
+      const rawId = item?.data_id?.toString?.() ?? String(item?.data_id ?? '');
+      if (!rawId || !Types.ObjectId.isValid(rawId)) {
+        throw new BadRequestException({
+          status: 'error',
+          message: `Invalid primary-data row id for ${infoType}.`,
+        });
+      }
+      const allowed = masterIdByInfoType.get(infoType) || new Set<string>();
+      if (!allowed.has(rawId)) {
+        throw new BadRequestException({
+          status: 'error',
+          message: `Invalid ${infoType.toUpperCase()} row mapping for data_id ${rawId}.`,
+        });
+      }
+      const dataId = new mongoose.Types.ObjectId(rawId);
 
       const update: any = {
-        info_type: item.info_type || 'gi',
+        info_type: infoType,
         parameter: item.parameter,
         category: item.category,
         gi_category: item.gi_category,

@@ -47,6 +47,17 @@ export class AdminProjectsController {
     return this.companyProjectsService.getLaunchTrainingProgramForAdmin(projectId);
   }
 
+  /**
+   * Admin: Primary Data (same payload as company endpoint).
+   * GET /api/admin/projects/:projectId/primary-data
+   * Legacy: GET /admin/projects/:projectId/primary-data
+   */
+  @Get(':projectId/primary-data')
+  @UseGuards(AdminJwtAuthGuard)
+  async getPrimaryDataForAdmin(@Param('projectId') projectId: string): Promise<any> {
+    return this.companyProjectsService.getPrimaryDataForAdmin(projectId);
+  }
+
   @Patch(':projectId/proforma-invoices/:invoiceId/approval')
   @Patch(':projectId/tax-invoices/:invoiceId/approval')
   @Patch(':projectId/finance-v2/proforma-invoices/:invoiceId/approval')
