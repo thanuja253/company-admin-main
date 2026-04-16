@@ -32,6 +32,12 @@ export class PrimaryDataForm {
   parameter?: string;
 
   @Prop()
+  category?: string;
+
+  @Prop()
+  gi_category?: string;
+
+  @Prop()
   reference_unit?: string;
 
   @Prop()

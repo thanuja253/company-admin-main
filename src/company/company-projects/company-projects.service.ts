@@ -61,6 +61,10 @@ import {
   latestByDataId,
   EE_CALCULATED_CHECKLIST_ORDERS,
   applyEeCalculationsByOrder,
+  WC_CALCULATED_CHECKLIST_ORDERS,
+  applyWcCalculationsByOrder,
+  RE_CALCULATED_CHECKLIST_ORDERS,
+  applyReCalculationsByOrder,
 } from './utils/ee-calc';
 
 function parseUtcCalendarDateFromYmd(input: string): Date {
@@ -125,6 +129,8 @@ export const INVOICE_APPROVAL_STATUS_COLORS = ['warning', 'success', 'danger', '
 export class CompanyProjectsService {
   private readonly EE_FY_KEYS: Array<'fy1' | 'fy2' | 'fy3' | 'fy4' | 'fy5'> = ['fy1', 'fy2', 'fy3', 'fy4', 'fy5'];
   private readonly EE_ALLOWED_THERMAL_UNITS = new Set(['GJ', 'Kcal', 'MTOE', 'kWh']);
+  private readonly WC_INPUT_ORDERS = [17, 20, 21, 22, 23, 24] as const;
+  private readonly RE_INPUT_ORDERS = [26, 103, 27, 104, 105] as const;
 
   private mapProposalStatusLabel(status: number | null | undefined): string {
     if (status === 1) return 'accepted_by_company';
@@ -1799,8 +1805,8 @@ export class CompanyProjectsService {
       5: { name: 'Work Order/ Contract Document Accepted', responsibility: 'CII' },
       6: { name: 'CII to provide Project Code', responsibility: 'CII' },
       7: { name: 'Assign Project Co‑Ordinator', responsibility: 'CII' },
-      8: { name: 'CII uploaded the PI/Tax Invoice', responsibility: 'CII' },
-      9: { name: 'Company Will Make Payment', responsibility: 'Company' },
+      8: { name: 'CII to upload the PI/Tax Invoice', responsibility: 'CII' },
+      9: { name: 'Company Paid Proforma Invoice', responsibility: 'Company' },
       10: { name: 'CII will Acknowlement Proforma Invoice', responsibility: 'CII' },
       11: { name: 'Need to Upload Primary Data Form', responsibility: 'Company' },
       12: { name: 'CII Approved All Primary Data', responsibility: 'CII' },
@@ -2246,15 +2252,30 @@ export class CompanyProjectsService {
       nextStepDisplayResponsibility = 'CII';
     }
     const proformaApprovalStatus = Number((proformaInvoiceWithDocument as any)?.approval_status ?? -1);
+    const proformaPaymentStatus = Number((proformaInvoiceWithDocument as any)?.payment_status ?? 0);
+    const hasProformaInvoiceDocument = !!String((proformaInvoiceWithDocument as any)?.invoice_document || '').trim();
     if (proformaApprovalStatus === 2) {
       latestStepDisplayName = 'CII rejected Proforma Invoice';
       latestStepDisplayResponsibility = 'CII';
       nextStepDisplayName = 'Company will Re pay 1st Performa Invoice';
       nextStepDisplayResponsibility = 'Company';
-    } else if (proformaApprovalStatus === 1 && Number((project as any).next_activities_id || 0) >= 11) {
+    } else if (proformaApprovalStatus === 1 && proformaPaymentStatus === 1) {
+      // Once proforma is paid and acknowledged, Quick View should move to Primary Data
+      // even when legacy next_activities_id was not advanced.
+      effectiveNextId = Math.max(effectiveNextId, 11);
       latestStepDisplayName = 'CII will Acknowlement Proforma Invoice';
       latestStepDisplayResponsibility = 'CII';
       nextStepDisplayName = 'Need to Upload Primary Data Form';
+      nextStepDisplayResponsibility = 'Company';
+    } else if (hasProformaInvoiceDocument && proformaPaymentStatus === 1 && proformaApprovalStatus === 0) {
+      latestStepDisplayName = 'Company Paid Proforma Invoice';
+      latestStepDisplayResponsibility = 'Company';
+      nextStepDisplayName = 'CII will Acknowlement Proforma Invoice';
+      nextStepDisplayResponsibility = 'CII';
+    } else if (hasProformaInvoiceDocument && proformaPaymentStatus === 0 && proformaApprovalStatus <= 0) {
+      latestStepDisplayName = 'CII to upload the PI/Tax Invoice';
+      latestStepDisplayResponsibility = 'CII';
+      nextStepDisplayName = 'Company Paid Proforma Invoice';
       nextStepDisplayResponsibility = 'Company';
     }
 
@@ -6022,6 +6043,8 @@ export class CompanyProjectsService {
         reference_unit: refUnit,
         reference_unit_display: refUnit,
         parameter: saved?.parameter ?? master.parameter,
+        category: saved?.category ?? master.category,
+        gi_category: saved?.gi_category ?? master.gi_category,
         details: saved?.details ?? master.details,
         fy1: saved?.fy1 ?? master.fy1 ?? 0,
         fy2: saved?.fy2 ?? master.fy2 ?? 0,
@@ -6044,19 +6067,43 @@ export class CompanyProjectsService {
     }
 
     // Compute EE in-place by checklist_order (6,7 inputs -> 8..16,142 calculated).
-    const { rows: calculatedRows, issues: eeCalculationIssues } = applyEeCalculationsByOrder(primary_data_rows);
-    const calculatedOrderSet = new Set<number>(EE_CALCULATED_CHECKLIST_ORDERS as unknown as number[]);
-    if (Array.isArray(calculatedRows.ee)) {
-      // Keep only master-defined rows in same order; values are already updated in-place by helper.
-      calculatedRows.ee = calculatedRows.ee.sort((a, b) => Number(a?.checklist_order || 0) - Number(b?.checklist_order || 0));
-      // Ensure all calculated rows are still present for UI even when values are pending.
-      const existingOrders = new Set(calculatedRows.ee.map((r) => Number(r?.checklist_order)));
+    const { rows: eeRowsCalculated, issues: eeCalculationIssues } = applyEeCalculationsByOrder(primary_data_rows);
+    const eeCalculatedOrderSet = new Set<number>(EE_CALCULATED_CHECKLIST_ORDERS as unknown as number[]);
+    if (Array.isArray(eeRowsCalculated.ee)) {
+      eeRowsCalculated.ee = eeRowsCalculated.ee.sort((a, b) => Number(a?.checklist_order || 0) - Number(b?.checklist_order || 0));
+      const existingOrders = new Set(eeRowsCalculated.ee.map((r) => Number(r?.checklist_order)));
       const missingCalc = (primary_data_rows.ee || []).filter(
-        (r) => calculatedOrderSet.has(Number(r?.checklist_order)) && !existingOrders.has(Number(r?.checklist_order)),
+        (r) => eeCalculatedOrderSet.has(Number(r?.checklist_order)) && !existingOrders.has(Number(r?.checklist_order)),
       );
-      if (missingCalc.length) calculatedRows.ee = [...calculatedRows.ee, ...missingCalc];
+      if (missingCalc.length) eeRowsCalculated.ee = [...eeRowsCalculated.ee, ...missingCalc];
     }
-    Object.assign(primary_data_rows, calculatedRows);
+    Object.assign(primary_data_rows, eeRowsCalculated);
+
+    // Compute WC in-place by checklist_order (17 inputs -> 18,19,25,102 calculated).
+    const { rows: wcRowsCalculated, issues: wcCalculationIssues } = applyWcCalculationsByOrder(primary_data_rows);
+    const wcCalculatedOrderSet = new Set<number>(WC_CALCULATED_CHECKLIST_ORDERS as unknown as number[]);
+    if (Array.isArray(wcRowsCalculated.wc)) {
+      wcRowsCalculated.wc = wcRowsCalculated.wc.sort((a, b) => Number(a?.checklist_order || 0) - Number(b?.checklist_order || 0));
+      const existingOrders = new Set(wcRowsCalculated.wc.map((r) => Number(r?.checklist_order)));
+      const missingCalc = (primary_data_rows.wc || []).filter(
+        (r) => wcCalculatedOrderSet.has(Number(r?.checklist_order)) && !existingOrders.has(Number(r?.checklist_order)),
+      );
+      if (missingCalc.length) wcRowsCalculated.wc = [...wcRowsCalculated.wc, ...missingCalc];
+    }
+    Object.assign(primary_data_rows, wcRowsCalculated);
+
+    // Compute RE in-place by checklist_order (26,103,27,104,105 inputs -> 106..110 calculated).
+    const { rows: reRowsCalculated, issues: reCalculationIssues } = applyReCalculationsByOrder(primary_data_rows);
+    const reCalculatedOrderSet = new Set<number>(RE_CALCULATED_CHECKLIST_ORDERS as unknown as number[]);
+    if (Array.isArray(reRowsCalculated.re)) {
+      reRowsCalculated.re = reRowsCalculated.re.sort((a, b) => Number(a?.checklist_order || 0) - Number(b?.checklist_order || 0));
+      const existingOrders = new Set(reRowsCalculated.re.map((r) => Number(r?.checklist_order)));
+      const missingCalc = (primary_data_rows.re || []).filter(
+        (r) => reCalculatedOrderSet.has(Number(r?.checklist_order)) && !existingOrders.has(Number(r?.checklist_order)),
+      );
+      if (missingCalc.length) reRowsCalculated.re = [...reRowsCalculated.re, ...missingCalc];
+    }
+    Object.assign(primary_data_rows, reRowsCalculated);
 
     return {
       status: 'success',
@@ -6070,6 +6117,8 @@ export class CompanyProjectsService {
         final_submit_docs: finalSubmitCount,
         primary_data_approval_count: approvalCount,
         ee_calculation_issues: eeCalculationIssues,
+        wc_calculation_issues: wcCalculationIssues,
+        re_calculation_issues: reCalculationIssues,
         document_status_labels: this.getPrimaryDataDocStatusLabels(),
         sections,
       },
@@ -6098,12 +6147,19 @@ export class CompanyProjectsService {
         .lean();
       for (const row of masterRows as any[]) {
         const dataId = row._id.toString();
-        const sectionRow = payload[dataId] ?? payload[row.parameter] ?? payload[row.checklist_name];
+        const checklistOrderKey = String(row?.checklist_order ?? '');
+        const sectionRow =
+          payload[dataId] ??
+          (checklistOrderKey ? payload[checklistOrderKey] : undefined) ??
+          payload[row.parameter] ??
+          payload[row.checklist_name];
         if (sectionRow == null) continue;
         doc.push({
           data_id: dataId,
           info_type: infoType,
           parameter: row.parameter,
+          category: sectionRow.category ?? row.category,
+          gi_category: sectionRow.gi_category ?? row.gi_category,
           reference_unit: sanitizeUnit(sectionRow.reference_unit ?? row.reference_unit ?? '-'),
           details: sectionRow.details,
           fy1: sectionRow.fy1 ?? 0,
@@ -6119,6 +6175,12 @@ export class CompanyProjectsService {
     }
     if (String(formType || '').toLowerCase() === 'ee') {
       doc = await this.prepareEePayloadForSave(companyId, projectId, doc);
+    }
+    if (String(formType || '').toLowerCase() === 'wc') {
+      doc = await this.prepareWcPayloadForSave(companyId, projectId, doc);
+    }
+    if (String(formType || '').toLowerCase() === 're') {
+      doc = await this.prepareRePayloadForSave(companyId, projectId, doc);
     }
     if (finalSubmit) {
       return this.submitPrimaryData(companyId, projectId, doc.length ? doc : []);
@@ -6577,6 +6639,309 @@ export class CompanyProjectsService {
     }));
   }
 
+  private yearNumber(row: any, key: 'fy1' | 'fy2' | 'fy3' | 'fy4' | 'fy5' | 'exp' | 'extrapolated'): number {
+    if (!row) return 0;
+    if (key === 'exp' || key === 'extrapolated') {
+      return this.toFiniteNumber(row.extrapolated ?? row.exp ?? row.fy5, 0);
+    }
+    return this.toFiniteNumber(row[key], 0);
+  }
+
+  private setYear(
+    row: any,
+    key: 'fy1' | 'fy2' | 'fy3' | 'fy4' | 'fy5' | 'exp' | 'extrapolated',
+    value: number | string,
+  ) {
+    if (!row) return;
+    if (key === 'exp' || key === 'extrapolated') {
+      row.extrapolated = value;
+      if (typeof value === 'number') row.fy5 = value;
+      return;
+    }
+    row[key] = value;
+  }
+
+  private applyWcCalculations(
+    rowsByDataId: Map<string, any>,
+    masterRows: any[],
+    equivalentProduct: Record<'fy1' | 'fy2' | 'fy3' | 'fy4' | 'fy5', number>,
+  ) {
+    const rowByOrder = (order: number) => this.findEeRow(masterRows, rowsByDataId, { order });
+
+    const r17 = rowByOrder(17);
+    const r18 = rowByOrder(18);
+    const r19 = rowByOrder(19);
+    const r20 = rowByOrder(20);
+    const r21 = rowByOrder(21);
+    const r22 = rowByOrder(22);
+    const r23 = rowByOrder(23);
+    const r24 = rowByOrder(24);
+    const r25 = rowByOrder(25);
+    const r102 = rowByOrder(102);
+
+    if (!r17) {
+      throw new BadRequestException({
+        status: 'error',
+        message: 'WC setup error: master_primary_data_checklist must include row 17 (Total fresh water consumption).',
+      });
+    }
+
+    // Preserve unit from details (legacy behavior in WaterConservationLibrary).
+    for (const row of [r17, r20, r21, r22, r23, r24]) {
+      if (!row) continue;
+      row.reference_unit = sanitizeUnit(row.details || row.reference_unit || '-');
+    }
+
+    for (const y of ['fy1', 'fy2', 'fy3', 'fy4', 'exp'] as const) {
+      const fresh = this.yearNumber(r17, y);
+      const den = y === 'exp'
+        ? this.toFiniteNumber(equivalentProduct.fy5, 0)
+        : this.toFiniteNumber((equivalentProduct as any)[y], 0);
+      const beyond = this.yearNumber(r24, y);
+
+      if (r18) this.setYear(r18, y, fresh !== 0 && den !== 0 ? this.roundTo(fresh / den) : 0);
+      if (r25) this.setYear(r25, y, fresh !== 0 && beyond !== 0 ? this.roundTo(beyond / fresh) : 0);
+    }
+
+    if (r18 && r19) {
+      r19.fy1 = 0; // Keep persisted rows numeric; GET can map display N/A.
+      const r18fy1 = this.yearNumber(r18, 'fy1');
+      const r18fy2 = this.yearNumber(r18, 'fy2');
+      const r18fy3 = this.yearNumber(r18, 'fy3');
+      const r18fy4 = this.yearNumber(r18, 'fy4');
+      const r18Exp = this.yearNumber(r18, 'exp');
+      r19.fy2 = r18fy1 ? this.roundTo(((r18fy1 - r18fy2) / r18fy1) * 100) : 0;
+      r19.fy3 = r18fy2 ? this.roundTo(((r18fy2 - r18fy3) / r18fy2) * 100) : 0;
+      r19.fy4 = r18fy3 ? this.roundTo(((r18fy3 - r18fy4) / r18fy3) * 100) : 0;
+      this.setYear(r19, 'exp', r18fy3 ? this.roundTo(((r18fy3 - r18Exp) / r18fy3) * 100) : 0);
+      r19.reference_unit = '%';
+    }
+
+    if (r18 && r102) {
+      r102.fy1 = 0;
+      r102.fy2 = 0;
+      r102.fy3 = 0;
+      const r18fy1 = this.yearNumber(r18, 'fy1');
+      const r18fy4 = this.yearNumber(r18, 'fy4');
+      r102.fy4 = r18fy1 && r18fy4 ? this.roundTo(((r18fy1 - r18fy4) * 100) / r18fy1) : 0;
+      this.setYear(r102, 'exp', 0);
+      r102.reference_unit = '%';
+    }
+
+    if (r18) r18.reference_unit = 'KL/unit';
+    if (r25) r25.reference_unit = '';
+  }
+
+  private async prepareWcPayloadForSave(companyId: string, projectId: string, incomingDoc: any[]): Promise<any[]> {
+    const mongoose = require('mongoose');
+    const pId = new mongoose.Types.ObjectId(projectId);
+
+    const [masterRows, existingRows] = await Promise.all([
+      this.masterPrimaryDataChecklistModel
+        .find({ info_type: 'wc', is_active: 1 })
+        .sort({ checklist_order: 1 })
+        .lean(),
+      this.primaryDataFormModel
+        .find({ company_id: companyId, project_id: pId, info_type: 'wc' })
+        .lean(),
+    ]);
+
+    const byMasterDataId = new Map<string, any>();
+    for (const m of masterRows as any[]) {
+      const id = m?._id?.toString?.() ?? String(m?._id ?? '');
+      byMasterDataId.set(id, m);
+    }
+
+    const rowsByDataId = new Map<string, any>();
+    for (const row of existingRows as any[]) {
+      const id = row?.data_id?.toString?.() ?? String(row?.data_id ?? '');
+      if (!id) continue;
+      rowsByDataId.set(id, { ...row, data_id: id, info_type: 'wc' });
+    }
+
+    for (const row of incomingDoc || []) {
+      const id = row?.data_id?.toString?.() ?? String(row?.data_id ?? '');
+      if (!id) continue;
+      const master = byMasterDataId.get(id);
+      const prev = rowsByDataId.get(id) || {};
+      rowsByDataId.set(id, {
+        ...prev,
+        ...row,
+        data_id: id,
+        info_type: 'wc',
+        parameter: row?.parameter ?? prev?.parameter ?? master?.parameter,
+        reference_unit: sanitizeUnit(row?.reference_unit ?? prev?.reference_unit ?? master?.reference_unit ?? '-'),
+        checklist_order: master?.checklist_order,
+      });
+    }
+
+    for (const [id, master] of byMasterDataId.entries()) {
+      if (rowsByDataId.has(id)) continue;
+      rowsByDataId.set(id, {
+        data_id: id,
+        info_type: 'wc',
+        parameter: master?.parameter,
+        reference_unit: sanitizeUnit(master?.reference_unit ?? '-'),
+        checklist_order: master?.checklist_order,
+        fy1: 0,
+        fy2: 0,
+        fy3: 0,
+        fy4: 0,
+        fy5: 0,
+        extrapolated: 0,
+      });
+    }
+
+    // Ensure required WC input rows exist by order.
+    for (const order of this.WC_INPUT_ORDERS) {
+      const row = this.findEeRow(masterRows as any[], rowsByDataId, { order });
+      if (!row) {
+        throw new BadRequestException({
+          status: 'error',
+          message: `WC setup error: master_primary_data_checklist is missing WC row ${order}.`,
+        });
+      }
+    }
+
+    const equivalentProduct = await this.getEquivalentProductFromGi(companyId, projectId);
+    if (!['fy1', 'fy2', 'fy3', 'fy4'].every((fy) => this.toFiniteNumber((equivalentProduct as any)[fy], 0) > 0)) {
+      throw new BadRequestException({
+        status: 'error',
+        message: 'WC validation failed: GI equivalent product row must exist with FY1-FY4 values greater than 0.',
+      });
+    }
+
+    this.applyWcCalculations(rowsByDataId, masterRows as any[], equivalentProduct);
+
+    return Array.from(rowsByDataId.values()).map((row) => ({
+      data_id: row.data_id,
+      info_type: 'wc',
+      parameter: row.parameter,
+      reference_unit: sanitizeUnit(row.reference_unit ?? '-'),
+      details: row.details,
+      fy1: this.toFiniteNumber(row.fy1, 0),
+      fy2: this.toFiniteNumber(row.fy2, 0),
+      fy3: this.toFiniteNumber(row.fy3, 0),
+      fy4: this.toFiniteNumber(row.fy4, 0),
+      fy5: this.toFiniteNumber(row.fy5, 0),
+      extrapolated: row.extrapolated != null ? this.toFiniteNumber(row.extrapolated, 0) : undefined,
+      lt_target: row.lt_target != null ? this.toFiniteNumber(row.lt_target, 0) : undefined,
+      additional_details: row.additional_details,
+    }));
+  }
+
+  private async prepareRePayloadForSave(companyId: string, projectId: string, incomingDoc: any[]): Promise<any[]> {
+    const mongoose = require('mongoose');
+    const pId = new mongoose.Types.ObjectId(projectId);
+
+    const [masterRows, existingRows, eeRows, eeMasterRows] = await Promise.all([
+      this.masterPrimaryDataChecklistModel
+        .find({ info_type: 're', is_active: 1 })
+        .sort({ checklist_order: 1 })
+        .lean(),
+      this.primaryDataFormModel
+        .find({ company_id: companyId, project_id: pId, info_type: 're' })
+        .lean(),
+      this.primaryDataFormModel
+        .find({ company_id: companyId, project_id: pId, info_type: 'ee' })
+        .lean(),
+      this.masterPrimaryDataChecklistModel
+        .find({ info_type: 'ee', is_active: 1 })
+        .select('_id checklist_order')
+        .lean(),
+    ]);
+
+    const byMasterDataId = new Map<string, any>();
+    for (const m of masterRows as any[]) {
+      const id = m?._id?.toString?.() ?? String(m?._id ?? '');
+      byMasterDataId.set(id, m);
+    }
+
+    const rowsByDataId = new Map<string, any>();
+    for (const row of existingRows as any[]) {
+      const id = row?.data_id?.toString?.() ?? String(row?.data_id ?? '');
+      if (!id) continue;
+      const master = byMasterDataId.get(id);
+      rowsByDataId.set(id, {
+        ...row,
+        data_id: id,
+        info_type: 're',
+        checklist_order: master?.checklist_order,
+      });
+    }
+
+    for (const row of incomingDoc || []) {
+      const id = row?.data_id?.toString?.() ?? String(row?.data_id ?? '');
+      if (!id) continue;
+      const master = byMasterDataId.get(id);
+      const prev = rowsByDataId.get(id) || {};
+      rowsByDataId.set(id, {
+        ...prev,
+        ...row,
+        data_id: id,
+        info_type: 're',
+        parameter: row?.parameter ?? prev?.parameter ?? master?.parameter,
+        reference_unit: sanitizeUnit(row?.reference_unit ?? prev?.reference_unit ?? master?.reference_unit ?? '-'),
+        checklist_order: master?.checklist_order,
+      });
+    }
+
+    for (const [id, master] of byMasterDataId.entries()) {
+      if (rowsByDataId.has(id)) continue;
+      rowsByDataId.set(id, {
+        data_id: id,
+        info_type: 're',
+        parameter: master?.parameter,
+        reference_unit: sanitizeUnit(master?.reference_unit ?? '-'),
+        checklist_order: master?.checklist_order,
+        fy1: 0,
+        fy2: 0,
+        fy3: 0,
+        fy4: 0,
+        fy5: 0,
+        extrapolated: 0,
+      });
+    }
+
+    const eeOrderByDataId = new Map<string, number>();
+    for (const row of eeMasterRows as any[]) {
+      const id = row?._id?.toString?.() ?? String(row?._id ?? '');
+      if (!id) continue;
+      eeOrderByDataId.set(id, Number(row?.checklist_order ?? 0));
+    }
+
+    const eeRowsForCalc: any[] = [];
+    for (const row of eeRows as any[]) {
+      const id = row?.data_id?.toString?.() ?? String(row?.data_id ?? '');
+      if (!id) continue;
+      const order = eeOrderByDataId.get(id);
+      if (!order) continue;
+      eeRowsForCalc.push({
+        ...row,
+        checklist_order: order,
+      });
+    }
+
+    const reRowsForCalc = Array.from(rowsByDataId.values());
+    applyReCalculationsByOrder({ re: reRowsForCalc, ee: eeRowsForCalc });
+
+    return reRowsForCalc.map((row) => ({
+      data_id: row.data_id,
+      info_type: 're',
+      parameter: row.parameter,
+      reference_unit: sanitizeUnit(row.reference_unit ?? '-'),
+      details: row.details,
+      fy1: this.toFiniteNumber(row.fy1, 0),
+      fy2: this.toFiniteNumber(row.fy2, 0),
+      fy3: this.toFiniteNumber(row.fy3, 0),
+      fy4: this.toFiniteNumber(row.fy4, 0),
+      fy5: this.toFiniteNumber(row.fy5, 0),
+      extrapolated: row.extrapolated != null ? this.toFiniteNumber(row.extrapolated, 0) : undefined,
+      lt_target: row.lt_target != null ? this.toFiniteNumber(row.lt_target, 0) : undefined,
+      additional_details: row.additional_details,
+    }));
+  }
+
   /**
    * Store Primary Data (field-by-field): update or insert from doc array. No final submit.
    * Accepts doc as array or object keyed by data_id (same shape as /save payload).
@@ -6600,6 +6965,8 @@ export class CompanyProjectsService {
           data_id,
           info_type: sectionRow?.info_type,
           parameter: sectionRow?.parameter,
+          category: sectionRow?.category,
+          gi_category: sectionRow?.gi_category,
           reference_unit: sectionRow?.reference_unit,
           details: sectionRow?.details,
           fy1: sectionRow?.fy1,
@@ -6619,6 +6986,8 @@ export class CompanyProjectsService {
       const update: any = {
         info_type: item.info_type || 'gi',
         parameter: item.parameter,
+        category: item.category,
+        gi_category: item.gi_category,
         reference_unit: sanitizeUnit(item.reference_unit ?? '-'),
         details: item.details,
         fy1: toNum(item.fy1) ?? 0,
@@ -7003,6 +7372,14 @@ export class CompanyProjectsService {
     }
     if (String(section || '').toLowerCase() === 'ee') {
       const recalculatedDoc = await this.prepareEePayloadForSave(companyId, projectId, []);
+      await this.storePrimaryData(companyId, projectId, recalculatedDoc);
+    }
+    if (String(section || '').toLowerCase() === 'wc') {
+      const recalculatedDoc = await this.prepareWcPayloadForSave(companyId, projectId, []);
+      await this.storePrimaryData(companyId, projectId, recalculatedDoc);
+    }
+    if (String(section || '').toLowerCase() === 're') {
+      const recalculatedDoc = await this.prepareRePayloadForSave(companyId, projectId, []);
       await this.storePrimaryData(companyId, projectId, recalculatedDoc);
     }
     return {
