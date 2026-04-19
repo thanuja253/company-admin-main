@@ -30,6 +30,7 @@ import {
 import { RegistrationInfoDto } from './dto/registration-info.dto';
 import { SubmitPaymentDto } from './dto/submit-payment.dto';
 import { SubmitFinancePaymentDto } from './dto/submit-finance-payment.dto';
+import { FinanceV2InvoiceDto } from './dto/finance-v2-invoice.dto';
 import { UpdateInvoiceApprovalDto } from './dto/update-invoice-approval.dto';
 import { UpdateQuickviewDataDto } from './dto/update-quickview-data.dto';
 import { WorkOrderPoDetailsDto } from './dto/work-order-po-details.dto';
@@ -64,7 +65,16 @@ import {
   WC_CALCULATED_CHECKLIST_ORDERS,
   applyWcCalculationsByOrder,
   RE_CALCULATED_CHECKLIST_ORDERS,
+  RE_LEGACY_ORDER_TO_CANONICAL,
   applyReCalculationsByOrder,
+  GGE_CALCULATED_CHECKLIST_ORDERS,
+  applyGgeCalculationsByOrder,
+  WM_CALCULATED_CHECKLIST_ORDERS,
+  applyWmCalculationsByOrder,
+  MCR_CALCULATED_CHECKLIST_ORDERS,
+  applyMcrCalculationsByOrder,
+  GSC_CALCULATED_CHECKLIST_ORDERS,
+  applyGscCalculationsByOrder,
 } from './utils/ee-calc';
 
 function parseUtcCalendarDateFromYmd(input: string): Date {
@@ -4420,6 +4430,242 @@ export class CompanyProjectsService {
     };
   }
 
+  private roundTo2(value: number): number {
+    return Math.round((Number(value) + Number.EPSILON) * 100) / 100;
+  }
+
+  private ensureFiniteNumber(value: any, field: string, min?: number, max?: number): number {
+    const n = Number(value);
+    if (!Number.isFinite(n)) {
+      throw new BadRequestException({ status: 'error', message: `${field} must be a valid number.` });
+    }
+    if (min !== undefined && n < min) {
+      throw new BadRequestException({ status: 'error', message: `${field} must be >= ${min}.` });
+    }
+    if (max !== undefined && n > max) {
+      throw new BadRequestException({ status: 'error', message: `${field} must be <= ${max}.` });
+    }
+    return n;
+  }
+
+  private ensureAtMostTwoDecimals(value: number, field: string): void {
+    const scaled = Math.round(value * 100);
+    if (Math.abs(value * 100 - scaled) > 1e-8) {
+      throw new BadRequestException({
+        status: 'error',
+        message: `${field} can have at most 2 decimal places.`,
+      });
+    }
+  }
+
+  private normalizeStateCode(value: any, field: string): string | undefined {
+    if (value === undefined || value === null || String(value).trim() === '') return undefined;
+    const code = String(value).trim();
+    if (!/^\d{2}$/.test(code)) {
+      throw new BadRequestException({
+        status: 'error',
+        message: `${field} must be exactly 2 digits.`,
+      });
+    }
+    const asNumber = Number(code);
+    if (asNumber < 1 || asNumber > 38) {
+      throw new BadRequestException({
+        status: 'error',
+        message: `${field === 'supplier_state_code' ? 'Supplier' : 'Place of supply'} state code must be between 01 and 38.`,
+      });
+    }
+    return code;
+  }
+
+  private normalizeFinanceInvoiceMeta(input: Partial<FinanceV2InvoiceDto>) {
+    const payableAmount = this.ensureFiniteNumber(input.payable_amount, 'payable_amount', 0);
+    if (payableAmount <= 0) {
+      throw new BadRequestException({
+        status: 'error',
+        message: 'payable_amount must be greater than 0.',
+      });
+    }
+    this.ensureAtMostTwoDecimals(payableAmount, 'payable_amount');
+
+    const sgst = this.ensureFiniteNumber(input.sgst ?? 0, 'sgst', 0, 28);
+    const cgst = this.ensureFiniteNumber(input.cgst ?? 0, 'cgst', 0, 28);
+    const igst = this.ensureFiniteNumber(input.igst ?? 0, 'igst', 0, 28);
+    this.ensureAtMostTwoDecimals(sgst, 'sgst');
+    this.ensureAtMostTwoDecimals(cgst, 'cgst');
+    this.ensureAtMostTwoDecimals(igst, 'igst');
+
+    const sgstAmt = this.ensureFiniteNumber(input.sgst_amt ?? 0, 'sgst_amt', 0);
+    const cgstAmt = this.ensureFiniteNumber(input.cgst_amt ?? 0, 'cgst_amt', 0);
+    const igstAmt = this.ensureFiniteNumber(input.igst_amt ?? 0, 'igst_amt', 0);
+    this.ensureAtMostTwoDecimals(sgstAmt, 'sgst_amt');
+    this.ensureAtMostTwoDecimals(cgstAmt, 'cgst_amt');
+    this.ensureAtMostTwoDecimals(igstAmt, 'igst_amt');
+
+    const supplierStateCode = this.normalizeStateCode(input.supplier_state_code, 'supplier_state_code');
+    const placeOfSupplyStateCode = this.normalizeStateCode(
+      input.place_of_supply_state_code,
+      'place_of_supply_state_code',
+    );
+
+    const isTaxable =
+      sgst > 0 || cgst > 0 || igst > 0 || sgstAmt > 0 || cgstAmt > 0 || igstAmt > 0;
+
+    if (isTaxable && (!supplierStateCode || !placeOfSupplyStateCode)) {
+      throw new BadRequestException({
+        status: 'error',
+        message:
+          'supplier_state_code and place_of_supply_state_code are required for taxable invoices.',
+      });
+    }
+
+    let isIntraState: boolean | undefined;
+    let transactionType: 'intra' | 'inter' | undefined;
+    if (supplierStateCode && placeOfSupplyStateCode) {
+      isIntraState = supplierStateCode === placeOfSupplyStateCode;
+      transactionType = isIntraState ? 'intra' : 'inter';
+    }
+
+    if (transactionType === 'intra') {
+      if (igst > 0 || igstAmt > 0) {
+        throw new BadRequestException({
+          status: 'error',
+          message: 'For intra-state, IGST must be 0.',
+        });
+      }
+      const anyRatePositive = sgst > 0 || cgst > 0 || igst > 0;
+      if (anyRatePositive) {
+        if (sgst <= 0 || cgst <= 0) {
+          throw new BadRequestException({
+            status: 'error',
+            message: 'For intra-state taxable invoices, both CGST and SGST must be > 0.',
+          });
+        }
+        if (Math.abs(sgst - cgst) > 1e-8) {
+          throw new BadRequestException({
+            status: 'error',
+            message: 'For intra-state, CGST and SGST must be equal.',
+          });
+        }
+      }
+    }
+
+    if (transactionType === 'inter') {
+      if (cgst > 0 || sgst > 0 || cgstAmt > 0 || sgstAmt > 0) {
+        throw new BadRequestException({
+          status: 'error',
+          message: 'For inter-state, CGST/SGST must be 0.',
+        });
+      }
+    }
+
+    const taxAmount = this.roundTo2(sgstAmt + cgstAmt + igstAmt);
+    const totalAmount = this.roundTo2(payableAmount + taxAmount);
+
+    if (input.tax_amount !== undefined) {
+      const providedTaxAmount = this.roundTo2(this.ensureFiniteNumber(input.tax_amount, 'tax_amount', 0));
+      if (Math.abs(providedTaxAmount - taxAmount) > 0.009) {
+        throw new BadRequestException({
+          status: 'error',
+          message: 'tax_amount must equal sgst_amt + cgst_amt + igst_amt.',
+        });
+      }
+    }
+    if (input.total_amount !== undefined) {
+      const providedTotalAmount = this.roundTo2(this.ensureFiniteNumber(input.total_amount, 'total_amount', 0));
+      if (Math.abs(providedTotalAmount - totalAmount) > 0.009) {
+        throw new BadRequestException({
+          status: 'error',
+          message: 'total_amount must equal payable_amount + tax_amount.',
+        });
+      }
+    }
+
+    return {
+      payable_amount: this.roundTo2(payableAmount),
+      sgst: this.roundTo2(sgst),
+      cgst: this.roundTo2(cgst),
+      igst: this.roundTo2(igst),
+      sgst_amt: this.roundTo2(sgstAmt),
+      cgst_amt: this.roundTo2(cgstAmt),
+      igst_amt: this.roundTo2(igstAmt),
+      tax_amount: taxAmount,
+      total_amount: totalAmount,
+      supplier_state_code: supplierStateCode,
+      place_of_supply_state_code: placeOfSupplyStateCode,
+      transaction_type: transactionType,
+      is_intra_state: isIntraState,
+      remarks: input.remarks?.trim() || undefined,
+    };
+  }
+
+  async createFinanceV2Invoice(
+    companyId: string,
+    projectId: string,
+    dto: FinanceV2InvoiceDto,
+  ) {
+    const resolvedProjectId = await this.resolveProjectIdForCompanyFinance(
+      companyId,
+      projectId,
+    );
+    const project = await this.projectModel.findOne({ _id: resolvedProjectId, company_id: companyId }).lean();
+    if (!project) {
+      throw new NotFoundException({ status: 'error', message: 'Project not found' });
+    }
+
+    const normalized = this.normalizeFinanceInvoiceMeta(dto);
+    const created = await this.companyInvoiceModel.create({
+      company_id: companyId,
+      project_id: resolvedProjectId,
+      payment_for: dto.payment_for,
+      ...normalized,
+    });
+
+    return {
+      status: 'success',
+      message: 'Finance invoice created successfully',
+      data: {
+        invoice_id: created._id.toString(),
+        payment_for: created.payment_for,
+        ...normalized,
+      },
+    };
+  }
+
+  async updateFinanceV2Invoice(
+    companyId: string,
+    projectId: string,
+    invoiceId: string,
+    dto: FinanceV2InvoiceDto,
+  ) {
+    const resolvedProjectId = await this.resolveProjectIdForCompanyFinance(
+      companyId,
+      projectId,
+    );
+    const invoice = await this.companyInvoiceModel.findOne({
+      _id: invoiceId,
+      company_id: companyId,
+      project_id: resolvedProjectId,
+    });
+    if (!invoice) {
+      throw new NotFoundException({ status: 'error', message: 'Invoice not found' });
+    }
+
+    const normalized = this.normalizeFinanceInvoiceMeta(dto);
+    invoice.payment_for = dto.payment_for;
+    Object.assign(invoice, normalized);
+    await invoice.save();
+
+    return {
+      status: 'success',
+      message: 'Finance invoice updated successfully',
+      data: {
+        invoice_id: invoice._id.toString(),
+        payment_for: invoice.payment_for,
+        ...normalized,
+      },
+    };
+  }
+
   /**
    * CII uploads PI (Proforma Invoice) or Tax Invoice document — next step after Assign Project Co-Ordinator / Resource Center.
    * Finds or creates an invoice for (project, payment_for) and sets invoice_document.
@@ -6097,17 +6343,18 @@ export class CompanyProjectsService {
     // saved_by_info_type.ee / saved_by_data_id must reflect the same calculated values as primary_data_rows.ee.
     const normalizedSavedByDataId: Record<string, any> = { ...savedByDataId };
     const normalizedByInfoType: Record<string, any[]> = { ...byInfoType };
+    const rowKeyPd = (row: any): string => {
+      const d = row?.data_id;
+      if (d != null && String(d).trim()) return String(d);
+      const m = row?._id;
+      if (m != null && String(m).trim()) return String(m);
+      return '';
+    };
     if (Array.isArray(primary_data_rows.ee)) {
       const eeSourceRows = Array.isArray(normalizedByInfoType.ee) ? [...normalizedByInfoType.ee] : [];
       const eeByDataId = new Map<string, any>();
       const eeByOrder = new Map<number, any>();
-      const rowKey = (row: any): string => {
-        const d = row?.data_id;
-        if (d != null && String(d).trim()) return String(d);
-        const m = row?._id;
-        if (m != null && String(m).trim()) return String(m);
-        return '';
-      };
+      const rowKey = rowKeyPd;
 
       for (const row of eeSourceRows) {
         const rid = rowKey(row);
@@ -6176,6 +6423,243 @@ export class CompanyProjectsService {
     }
     Object.assign(primary_data_rows, reRowsCalculated);
 
+    // Keep saved_by_info_type.re / saved_by_data_id aligned with primary_data_rows.re for calculated rows.
+    if (Array.isArray(primary_data_rows.re)) {
+      const reSourceRows = Array.isArray(normalizedByInfoType.re) ? [...normalizedByInfoType.re] : [];
+      const reByDataId = new Map<string, any>();
+      const reByOrder = new Map<number, any>();
+      const reCalcSet = new Set<number>(RE_CALCULATED_CHECKLIST_ORDERS as unknown as number[]);
+
+      for (const row of reSourceRows) {
+        const rid = rowKeyPd(row);
+        if (rid) reByDataId.set(rid, row);
+        const ord = Number(row?.checklist_order);
+        if (Number.isFinite(ord)) reByOrder.set(ord, row);
+      }
+
+      for (const row of primary_data_rows.re) {
+        const order = Number(row?.checklist_order);
+        if (!reCalcSet.has(order)) continue;
+        const rid = rowKeyPd(row);
+
+        if (rid) {
+          const prev = reByDataId.get(rid) || normalizedSavedByDataId[rid] || {};
+          const merged = { ...prev, ...row };
+          reByDataId.set(rid, merged);
+          normalizedSavedByDataId[rid] = merged;
+        } else if (Number.isFinite(order)) {
+          const prev = reByOrder.get(order) || {};
+          reByOrder.set(order, { ...prev, ...row });
+        }
+      }
+
+      const dedupRe = new Map<string, any>();
+      for (const row of reByDataId.values()) {
+        const rid = rowKeyPd(row);
+        if (!rid) continue;
+        dedupRe.set(rid, row);
+      }
+      for (const row of reByOrder.values()) {
+        const rid = rowKeyPd(row);
+        if (rid && dedupRe.has(rid)) continue;
+        const key = rid || `order_${Number(row?.checklist_order ?? 0)}`;
+        dedupRe.set(key, row);
+      }
+      normalizedByInfoType.re = Array.from(dedupRe.values()).sort(
+        (a, b) => Number(a?.checklist_order || 0) - Number(b?.checklist_order || 0),
+      );
+    }
+
+    // Compute GGE in-place (GreenhouseGasesEmissionsLibrary — inputs 111–114, 121–122, 125–127; derived 139, 116–120, 123–131).
+    const { rows: ggeRowsCalculated, issues: ggeCalculationIssues } = applyGgeCalculationsByOrder(primary_data_rows);
+    const ggeCalculatedOrderSet = new Set<number>(GGE_CALCULATED_CHECKLIST_ORDERS as unknown as number[]);
+    if (Array.isArray(ggeRowsCalculated.gge)) {
+      ggeRowsCalculated.gge = ggeRowsCalculated.gge.sort((a, b) => Number(a?.checklist_order || 0) - Number(b?.checklist_order || 0));
+      const existingGgeOrders = new Set(ggeRowsCalculated.gge.map((r) => Number(r?.checklist_order)));
+      const missingGgeCalc = (primary_data_rows.gge || []).filter(
+        (r) => ggeCalculatedOrderSet.has(Number(r?.checklist_order)) && !existingGgeOrders.has(Number(r?.checklist_order)),
+      );
+      if (missingGgeCalc.length) ggeRowsCalculated.gge = [...ggeRowsCalculated.gge, ...missingGgeCalc];
+    }
+    Object.assign(primary_data_rows, ggeRowsCalculated);
+
+    if (Array.isArray(primary_data_rows.gge)) {
+      const ggeSourceRows = Array.isArray(normalizedByInfoType.gge) ? [...normalizedByInfoType.gge] : [];
+      const ggeByDataId = new Map<string, any>();
+      const ggeByOrder = new Map<number, any>();
+      const ggeCalcSet = new Set<number>(GGE_CALCULATED_CHECKLIST_ORDERS as unknown as number[]);
+
+      for (const row of ggeSourceRows) {
+        const rid = rowKeyPd(row);
+        if (rid) ggeByDataId.set(rid, row);
+        const ord = Number(row?.checklist_order);
+        if (Number.isFinite(ord)) ggeByOrder.set(ord, row);
+      }
+
+      for (const row of primary_data_rows.gge) {
+        const order = Number(row?.checklist_order);
+        if (!ggeCalcSet.has(order)) continue;
+        const rid = rowKeyPd(row);
+
+        if (rid) {
+          const prev = ggeByDataId.get(rid) || normalizedSavedByDataId[rid] || {};
+          const merged = { ...prev, ...row };
+          ggeByDataId.set(rid, merged);
+          normalizedSavedByDataId[rid] = merged;
+        } else if (Number.isFinite(order)) {
+          const prev = ggeByOrder.get(order) || {};
+          ggeByOrder.set(order, { ...prev, ...row });
+        }
+      }
+
+      const dedupGge = new Map<string, any>();
+      for (const row of ggeByDataId.values()) {
+        const rid = rowKeyPd(row);
+        if (!rid) continue;
+        dedupGge.set(rid, row);
+      }
+      for (const row of ggeByOrder.values()) {
+        const rid = rowKeyPd(row);
+        if (rid && dedupGge.has(rid)) continue;
+        const key = rid || `order_${Number(row?.checklist_order ?? 0)}`;
+        dedupGge.set(key, row);
+      }
+      normalizedByInfoType.gge = Array.from(dedupGge.values()).sort(
+        (a, b) => Number(a?.checklist_order || 0) - Number(b?.checklist_order || 0),
+      );
+    }
+
+    // Compute WM in-place (WastManagementLibrary — inputs 44, 46, 137, 49–53; derived 138, 132–136, 47).
+    const { rows: wmRowsCalculated, issues: wmCalculationIssues } = applyWmCalculationsByOrder(primary_data_rows);
+    const wmCalculatedOrderSet = new Set<number>(WM_CALCULATED_CHECKLIST_ORDERS as unknown as number[]);
+    if (Array.isArray(wmRowsCalculated.wm)) {
+      wmRowsCalculated.wm = wmRowsCalculated.wm.sort((a, b) => Number(a?.checklist_order || 0) - Number(b?.checklist_order || 0));
+      const existingWmOrders = new Set(wmRowsCalculated.wm.map((r) => Number(r?.checklist_order)));
+      const missingWmCalc = (primary_data_rows.wm || []).filter(
+        (r) => wmCalculatedOrderSet.has(Number(r?.checklist_order)) && !existingWmOrders.has(Number(r?.checklist_order)),
+      );
+      if (missingWmCalc.length) wmRowsCalculated.wm = [...wmRowsCalculated.wm, ...missingWmCalc];
+    }
+    Object.assign(primary_data_rows, wmRowsCalculated);
+
+    if (Array.isArray(primary_data_rows.wm)) {
+      const wmSourceRows = Array.isArray(normalizedByInfoType.wm) ? [...normalizedByInfoType.wm] : [];
+      const wmByDataId = new Map<string, any>();
+      const wmByOrder = new Map<number, any>();
+      const wmCalcSet = new Set<number>(WM_CALCULATED_CHECKLIST_ORDERS as unknown as number[]);
+
+      for (const row of wmSourceRows) {
+        const rid = rowKeyPd(row);
+        if (rid) wmByDataId.set(rid, row);
+        const ord = Number(row?.checklist_order);
+        if (Number.isFinite(ord)) wmByOrder.set(ord, row);
+      }
+
+      for (const row of primary_data_rows.wm) {
+        const order = Number(row?.checklist_order);
+        if (!wmCalcSet.has(order)) continue;
+        const rid = rowKeyPd(row);
+
+        if (rid) {
+          const prev = wmByDataId.get(rid) || normalizedSavedByDataId[rid] || {};
+          const merged = { ...prev, ...row };
+          wmByDataId.set(rid, merged);
+          normalizedSavedByDataId[rid] = merged;
+        } else if (Number.isFinite(order)) {
+          const prev = wmByOrder.get(order) || {};
+          wmByOrder.set(order, { ...prev, ...row });
+        }
+      }
+
+      const dedupWm = new Map<string, any>();
+      for (const row of wmByDataId.values()) {
+        const rid = rowKeyPd(row);
+        if (!rid) continue;
+        dedupWm.set(rid, row);
+      }
+      for (const row of wmByOrder.values()) {
+        const rid = rowKeyPd(row);
+        if (rid && dedupWm.has(rid)) continue;
+        const key = rid || `order_${Number(row?.checklist_order ?? 0)}`;
+        dedupWm.set(key, row);
+      }
+      normalizedByInfoType.wm = Array.from(dedupWm.values()).sort(
+        (a, b) => Number(a?.checklist_order || 0) - Number(b?.checklist_order || 0),
+      );
+    }
+
+    // Compute MCR in-place (MaterialCalculationLibrary — inputs 101, 100, 99, 98, 97, 57; derived 54–56).
+    const { rows: mcrRowsCalculated, issues: mcrCalculationIssues } = applyMcrCalculationsByOrder(primary_data_rows);
+    const mcrCalculatedOrderSet = new Set<number>(MCR_CALCULATED_CHECKLIST_ORDERS as unknown as number[]);
+    if (Array.isArray(mcrRowsCalculated.mcr)) {
+      mcrRowsCalculated.mcr = mcrRowsCalculated.mcr.sort((a, b) => Number(a?.checklist_order || 0) - Number(b?.checklist_order || 0));
+      const existingMcrOrders = new Set(mcrRowsCalculated.mcr.map((r) => Number(r?.checklist_order)));
+      const missingMcrCalc = (primary_data_rows.mcr || []).filter(
+        (r) => mcrCalculatedOrderSet.has(Number(r?.checklist_order)) && !existingMcrOrders.has(Number(r?.checklist_order)),
+      );
+      if (missingMcrCalc.length) mcrRowsCalculated.mcr = [...mcrRowsCalculated.mcr, ...missingMcrCalc];
+    }
+    Object.assign(primary_data_rows, mcrRowsCalculated);
+
+    if (Array.isArray(primary_data_rows.mcr)) {
+      const mcrSourceRows = Array.isArray(normalizedByInfoType.mcr) ? [...normalizedByInfoType.mcr] : [];
+      const mcrByDataId = new Map<string, any>();
+      const mcrByOrder = new Map<number, any>();
+      const mcrCalcSet = new Set<number>(MCR_CALCULATED_CHECKLIST_ORDERS as unknown as number[]);
+
+      for (const row of mcrSourceRows) {
+        const rid = rowKeyPd(row);
+        if (rid) mcrByDataId.set(rid, row);
+        const ord = Number(row?.checklist_order);
+        if (Number.isFinite(ord)) mcrByOrder.set(ord, row);
+      }
+
+      for (const row of primary_data_rows.mcr) {
+        const order = Number(row?.checklist_order);
+        if (!mcrCalcSet.has(order)) continue;
+        const rid = rowKeyPd(row);
+
+        if (rid) {
+          const prev = mcrByDataId.get(rid) || normalizedSavedByDataId[rid] || {};
+          const merged = { ...prev, ...row };
+          mcrByDataId.set(rid, merged);
+          normalizedSavedByDataId[rid] = merged;
+        } else if (Number.isFinite(order)) {
+          const prev = mcrByOrder.get(order) || {};
+          mcrByOrder.set(order, { ...prev, ...row });
+        }
+      }
+
+      const dedupMcr = new Map<string, any>();
+      for (const row of mcrByDataId.values()) {
+        const rid = rowKeyPd(row);
+        if (!rid) continue;
+        dedupMcr.set(rid, row);
+      }
+      for (const row of mcrByOrder.values()) {
+        const rid = rowKeyPd(row);
+        if (rid && dedupMcr.has(rid)) continue;
+        const key = rid || `order_${Number(row?.checklist_order ?? 0)}`;
+        dedupMcr.set(key, row);
+      }
+      normalizedByInfoType.mcr = Array.from(dedupMcr.values()).sort(
+        (a, b) => Number(a?.checklist_order || 0) - Number(b?.checklist_order || 0),
+      );
+    }
+
+    // GSC in-place (GreenSupplyChainLibrary — pass-through unit from details for 58–66, 96; no derived rows).
+    const { rows: gscRowsCalculated, issues: gscCalculationIssues } = applyGscCalculationsByOrder(primary_data_rows);
+    const gscCalculatedOrderSet = new Set<number>(GSC_CALCULATED_CHECKLIST_ORDERS as unknown as number[]);
+    if (Array.isArray(gscRowsCalculated.gsc)) {
+      gscRowsCalculated.gsc = gscRowsCalculated.gsc.sort((a, b) => Number(a?.checklist_order || 0) - Number(b?.checklist_order || 0));
+      const existingGscOrders = new Set(gscRowsCalculated.gsc.map((r) => Number(r?.checklist_order)));
+      const missingGscCalc = (primary_data_rows.gsc || []).filter(
+        (r) => gscCalculatedOrderSet.has(Number(r?.checklist_order)) && !existingGscOrders.has(Number(r?.checklist_order)),
+      );
+      if (missingGscCalc.length) gscRowsCalculated.gsc = [...gscRowsCalculated.gsc, ...missingGscCalc];
+    }
+    Object.assign(primary_data_rows, gscRowsCalculated);
+
     return {
       status: 'success',
       message: 'Primary data form retrieved',
@@ -6190,6 +6674,10 @@ export class CompanyProjectsService {
         ee_calculation_issues: eeCalculationIssues,
         wc_calculation_issues: wcCalculationIssues,
         re_calculation_issues: reCalculationIssues,
+        gge_calculation_issues: ggeCalculationIssues,
+        wm_calculation_issues: wmCalculationIssues,
+        mcr_calculation_issues: mcrCalculationIssues,
+        gsc_calculation_issues: gscCalculationIssues,
         document_status_labels: this.getPrimaryDataDocStatusLabels(),
         sections,
       },
@@ -6242,9 +6730,18 @@ export class CompanyProjectsService {
       const rawId = row?.data_id?.toString?.() ?? String(row?.data_id ?? '');
       if (rawId && byMasterId.has(rawId)) return rawId;
       const idNum = Number(rawId);
+      const reCanon = RE_LEGACY_ORDER_TO_CANONICAL as Record<number, number>;
+      if (String(infoType || '').toLowerCase() === 're' && Number.isFinite(idNum)) {
+        const mapped = reCanon[idNum];
+        if (mapped !== undefined && byOrder.has(mapped)) return byOrder.get(mapped);
+      }
       if (Number.isFinite(idNum) && byOrder.has(idNum)) return byOrder.get(idNum);
 
       const rowOrder = Number(row?.checklist_order);
+      if (String(infoType || '').toLowerCase() === 're' && Number.isFinite(rowOrder)) {
+        const mapped = reCanon[rowOrder];
+        if (mapped !== undefined && byOrder.has(mapped)) return byOrder.get(mapped);
+      }
       if (Number.isFinite(rowOrder) && byOrder.has(rowOrder)) return byOrder.get(rowOrder);
 
       const pKey = this.normalizeText(row?.parameter);
@@ -6310,6 +6807,18 @@ export class CompanyProjectsService {
     }
     if (String(formType || '').toLowerCase() === 're') {
       doc = await this.prepareRePayloadForSave(companyId, projectId, doc);
+    }
+    if (String(formType || '').toLowerCase() === 'gge') {
+      doc = await this.prepareGgePayloadForSave(companyId, projectId, doc);
+    }
+    if (String(formType || '').toLowerCase() === 'wm') {
+      doc = await this.prepareWmPayloadForSave(companyId, projectId, doc);
+    }
+    if (String(formType || '').toLowerCase() === 'mcr') {
+      doc = await this.prepareMcrPayloadForSave(companyId, projectId, doc);
+    }
+    if (String(formType || '').toLowerCase() === 'gsc') {
+      doc = await this.prepareGscPayloadForSave(companyId, projectId, doc);
     }
     if (finalSubmit) {
       return this.submitPrimaryData(companyId, projectId, doc.length ? doc : []);
@@ -7029,6 +7538,418 @@ export class CompanyProjectsService {
     }));
   }
 
+  private async prepareGgePayloadForSave(companyId: string, projectId: string, incomingDoc: any[]): Promise<any[]> {
+    const mongoose = require('mongoose');
+    const pId = new mongoose.Types.ObjectId(projectId);
+
+    const [masterRows, existingRows, giRows, giMasterRows] = await Promise.all([
+      this.masterPrimaryDataChecklistModel
+        .find({ info_type: 'gge', is_active: 1 })
+        .sort({ checklist_order: 1 })
+        .lean(),
+      this.primaryDataFormModel
+        .find({ company_id: companyId, project_id: pId, info_type: 'gge' })
+        .lean(),
+      this.primaryDataFormModel
+        .find({ company_id: companyId, project_id: pId, info_type: 'gi' })
+        .lean(),
+      this.masterPrimaryDataChecklistModel
+        .find({ info_type: 'gi', is_active: 1 })
+        .select('_id checklist_order')
+        .lean(),
+    ]);
+
+    const byMasterDataId = new Map<string, any>();
+    for (const m of masterRows as any[]) {
+      const id = m?._id?.toString?.() ?? String(m?._id ?? '');
+      byMasterDataId.set(id, m);
+    }
+
+    const rowsByDataId = new Map<string, any>();
+    for (const row of existingRows as any[]) {
+      const id = row?.data_id?.toString?.() ?? String(row?.data_id ?? '');
+      if (!id) continue;
+      const master = byMasterDataId.get(id);
+      rowsByDataId.set(id, {
+        ...row,
+        data_id: id,
+        info_type: 'gge',
+        checklist_order: master?.checklist_order,
+      });
+    }
+
+    for (const row of incomingDoc || []) {
+      const id = row?.data_id?.toString?.() ?? String(row?.data_id ?? '');
+      if (!id) continue;
+      const master = byMasterDataId.get(id);
+      const prev = rowsByDataId.get(id) || {};
+      rowsByDataId.set(id, {
+        ...prev,
+        ...row,
+        data_id: id,
+        info_type: 'gge',
+        parameter: row?.parameter ?? prev?.parameter ?? master?.parameter,
+        reference_unit: sanitizeUnit(row?.reference_unit ?? prev?.reference_unit ?? master?.reference_unit ?? '-'),
+        checklist_order: master?.checklist_order,
+      });
+    }
+
+    for (const [id, master] of byMasterDataId.entries()) {
+      if (rowsByDataId.has(id)) continue;
+      rowsByDataId.set(id, {
+        data_id: id,
+        info_type: 'gge',
+        parameter: master?.parameter,
+        reference_unit: sanitizeUnit(master?.reference_unit ?? '-'),
+        checklist_order: master?.checklist_order,
+        fy1: 0,
+        fy2: 0,
+        fy3: 0,
+        fy4: 0,
+        fy5: 0,
+        extrapolated: 0,
+      });
+    }
+
+    const giOrderByDataId = new Map<string, number>();
+    for (const row of giMasterRows as any[]) {
+      const id = row?._id?.toString?.() ?? String(row?._id ?? '');
+      if (!id) continue;
+      giOrderByDataId.set(id, Number(row?.checklist_order ?? 0));
+    }
+
+    const giRowsForCalc: any[] = [];
+    for (const row of giRows as any[]) {
+      const id = row?.data_id?.toString?.() ?? String(row?.data_id ?? '');
+      if (!id) continue;
+      const order = giOrderByDataId.get(id);
+      if (!order) continue;
+      giRowsForCalc.push({
+        ...row,
+        checklist_order: order,
+      });
+    }
+
+    const ggeRowsForCalc = Array.from(rowsByDataId.values());
+    applyGgeCalculationsByOrder({ gge: ggeRowsForCalc, gi: giRowsForCalc });
+
+    const fyOrNa = (v: unknown) => (v === 'N/A' ? 'N/A' : this.toFiniteNumber(v, 0));
+    const expOrNa = (v: unknown) =>
+      v === 'N/A' ? 'N/A' : v != null ? this.toFiniteNumber(v, 0) : undefined;
+
+    return ggeRowsForCalc.map((row) => ({
+      data_id: row.data_id,
+      info_type: 'gge',
+      parameter: row.parameter,
+      reference_unit: sanitizeUnit(row.reference_unit ?? '-'),
+      details: row.details,
+      fy1: fyOrNa(row.fy1),
+      fy2: fyOrNa(row.fy2),
+      fy3: fyOrNa(row.fy3),
+      fy4: fyOrNa(row.fy4),
+      fy5: fyOrNa(row.fy5),
+      extrapolated: expOrNa(row.extrapolated),
+      lt_target: row.lt_target != null ? this.toFiniteNumber(row.lt_target, 0) : undefined,
+      additional_details: row.additional_details,
+    }));
+  }
+
+  private async prepareWmPayloadForSave(companyId: string, projectId: string, incomingDoc: any[]): Promise<any[]> {
+    const mongoose = require('mongoose');
+    const pId = new mongoose.Types.ObjectId(projectId);
+
+    const [masterRows, existingRows, giRows, giMasterRows] = await Promise.all([
+      this.masterPrimaryDataChecklistModel
+        .find({ info_type: 'wm', is_active: 1 })
+        .sort({ checklist_order: 1 })
+        .lean(),
+      this.primaryDataFormModel
+        .find({ company_id: companyId, project_id: pId, info_type: 'wm' })
+        .lean(),
+      this.primaryDataFormModel
+        .find({ company_id: companyId, project_id: pId, info_type: 'gi' })
+        .lean(),
+      this.masterPrimaryDataChecklistModel
+        .find({ info_type: 'gi', is_active: 1 })
+        .select('_id checklist_order')
+        .lean(),
+    ]);
+
+    const byMasterDataId = new Map<string, any>();
+    for (const m of masterRows as any[]) {
+      const id = m?._id?.toString?.() ?? String(m?._id ?? '');
+      byMasterDataId.set(id, m);
+    }
+
+    const rowsByDataId = new Map<string, any>();
+    for (const row of existingRows as any[]) {
+      const id = row?.data_id?.toString?.() ?? String(row?.data_id ?? '');
+      if (!id) continue;
+      const master = byMasterDataId.get(id);
+      rowsByDataId.set(id, {
+        ...row,
+        data_id: id,
+        info_type: 'wm',
+        checklist_order: master?.checklist_order,
+      });
+    }
+
+    for (const row of incomingDoc || []) {
+      const id = row?.data_id?.toString?.() ?? String(row?.data_id ?? '');
+      if (!id) continue;
+      const master = byMasterDataId.get(id);
+      const prev = rowsByDataId.get(id) || {};
+      rowsByDataId.set(id, {
+        ...prev,
+        ...row,
+        data_id: id,
+        info_type: 'wm',
+        parameter: row?.parameter ?? prev?.parameter ?? master?.parameter,
+        reference_unit: sanitizeUnit(row?.reference_unit ?? prev?.reference_unit ?? master?.reference_unit ?? '-'),
+        checklist_order: master?.checklist_order,
+      });
+    }
+
+    for (const [id, master] of byMasterDataId.entries()) {
+      if (rowsByDataId.has(id)) continue;
+      rowsByDataId.set(id, {
+        data_id: id,
+        info_type: 'wm',
+        parameter: master?.parameter,
+        reference_unit: sanitizeUnit(master?.reference_unit ?? '-'),
+        checklist_order: master?.checklist_order,
+        fy1: 0,
+        fy2: 0,
+        fy3: 0,
+        fy4: 0,
+        fy5: 0,
+        extrapolated: 0,
+      });
+    }
+
+    const giOrderByDataId = new Map<string, number>();
+    for (const row of giMasterRows as any[]) {
+      const id = row?._id?.toString?.() ?? String(row?._id ?? '');
+      if (!id) continue;
+      giOrderByDataId.set(id, Number(row?.checklist_order ?? 0));
+    }
+
+    const giRowsForCalc: any[] = [];
+    for (const row of giRows as any[]) {
+      const id = row?.data_id?.toString?.() ?? String(row?.data_id ?? '');
+      if (!id) continue;
+      const order = giOrderByDataId.get(id);
+      if (!order) continue;
+      giRowsForCalc.push({
+        ...row,
+        checklist_order: order,
+      });
+    }
+
+    const wmRowsForCalc = Array.from(rowsByDataId.values());
+    applyWmCalculationsByOrder({ wm: wmRowsForCalc, gi: giRowsForCalc });
+
+    const fyOrNa = (v: unknown) => (v === 'N/A' ? 'N/A' : this.toFiniteNumber(v, 0));
+    const expOrNa = (v: unknown) =>
+      v === 'N/A' ? 'N/A' : v != null ? this.toFiniteNumber(v, 0) : undefined;
+
+    return wmRowsForCalc.map((row) => ({
+      data_id: row.data_id,
+      info_type: 'wm',
+      parameter: row.parameter,
+      reference_unit: sanitizeUnit(row.reference_unit ?? '-'),
+      details: row.details,
+      fy1: fyOrNa(row.fy1),
+      fy2: fyOrNa(row.fy2),
+      fy3: fyOrNa(row.fy3),
+      fy4: fyOrNa(row.fy4),
+      fy5: fyOrNa(row.fy5),
+      extrapolated: expOrNa(row.extrapolated),
+      lt_target: row.lt_target != null ? this.toFiniteNumber(row.lt_target, 0) : undefined,
+      additional_details: row.additional_details,
+    }));
+  }
+
+  private async prepareMcrPayloadForSave(companyId: string, projectId: string, incomingDoc: any[]): Promise<any[]> {
+    const mongoose = require('mongoose');
+    const pId = new mongoose.Types.ObjectId(projectId);
+
+    const [masterRows, existingRows] = await Promise.all([
+      this.masterPrimaryDataChecklistModel
+        .find({ info_type: 'mcr', is_active: 1 })
+        .sort({ checklist_order: 1 })
+        .lean(),
+      this.primaryDataFormModel
+        .find({ company_id: companyId, project_id: pId, info_type: 'mcr' })
+        .lean(),
+    ]);
+
+    const byMasterDataId = new Map<string, any>();
+    for (const m of masterRows as any[]) {
+      const id = m?._id?.toString?.() ?? String(m?._id ?? '');
+      byMasterDataId.set(id, m);
+    }
+
+    const rowsByDataId = new Map<string, any>();
+    for (const row of existingRows as any[]) {
+      const id = row?.data_id?.toString?.() ?? String(row?.data_id ?? '');
+      if (!id) continue;
+      const master = byMasterDataId.get(id);
+      rowsByDataId.set(id, {
+        ...row,
+        data_id: id,
+        info_type: 'mcr',
+        checklist_order: master?.checklist_order,
+      });
+    }
+
+    for (const row of incomingDoc || []) {
+      const id = row?.data_id?.toString?.() ?? String(row?.data_id ?? '');
+      if (!id) continue;
+      const master = byMasterDataId.get(id);
+      const prev = rowsByDataId.get(id) || {};
+      rowsByDataId.set(id, {
+        ...prev,
+        ...row,
+        data_id: id,
+        info_type: 'mcr',
+        parameter: row?.parameter ?? prev?.parameter ?? master?.parameter,
+        reference_unit: sanitizeUnit(row?.reference_unit ?? prev?.reference_unit ?? master?.reference_unit ?? '-'),
+        checklist_order: master?.checklist_order,
+      });
+    }
+
+    for (const [id, master] of byMasterDataId.entries()) {
+      if (rowsByDataId.has(id)) continue;
+      rowsByDataId.set(id, {
+        data_id: id,
+        info_type: 'mcr',
+        parameter: master?.parameter,
+        reference_unit: sanitizeUnit(master?.reference_unit ?? '-'),
+        checklist_order: master?.checklist_order,
+        fy1: 0,
+        fy2: 0,
+        fy3: 0,
+        fy4: 0,
+        fy5: 0,
+        extrapolated: 0,
+      });
+    }
+
+    const mcrRowsForCalc = Array.from(rowsByDataId.values());
+    applyMcrCalculationsByOrder({ mcr: mcrRowsForCalc });
+
+    const fyOrNa = (v: unknown) => (v === 'N/A' ? 'N/A' : this.toFiniteNumber(v, 0));
+    const expOrNa = (v: unknown) =>
+      v === 'N/A' ? 'N/A' : v != null ? this.toFiniteNumber(v, 0) : undefined;
+
+    return mcrRowsForCalc.map((row) => ({
+      data_id: row.data_id,
+      info_type: 'mcr',
+      parameter: row.parameter,
+      reference_unit: sanitizeUnit(row.reference_unit ?? '-'),
+      details: row.details,
+      fy1: fyOrNa(row.fy1),
+      fy2: fyOrNa(row.fy2),
+      fy3: fyOrNa(row.fy3),
+      fy4: fyOrNa(row.fy4),
+      fy5: fyOrNa(row.fy5),
+      extrapolated: expOrNa(row.extrapolated),
+      lt_target: row.lt_target != null ? this.toFiniteNumber(row.lt_target, 0) : undefined,
+      additional_details: row.additional_details,
+    }));
+  }
+
+  private async prepareGscPayloadForSave(companyId: string, projectId: string, incomingDoc: any[]): Promise<any[]> {
+    const mongoose = require('mongoose');
+    const pId = new mongoose.Types.ObjectId(projectId);
+
+    const [masterRows, existingRows] = await Promise.all([
+      this.masterPrimaryDataChecklistModel
+        .find({ info_type: 'gsc', is_active: 1 })
+        .sort({ checklist_order: 1 })
+        .lean(),
+      this.primaryDataFormModel
+        .find({ company_id: companyId, project_id: pId, info_type: 'gsc' })
+        .lean(),
+    ]);
+
+    const byMasterDataId = new Map<string, any>();
+    for (const m of masterRows as any[]) {
+      const id = m?._id?.toString?.() ?? String(m?._id ?? '');
+      byMasterDataId.set(id, m);
+    }
+
+    const rowsByDataId = new Map<string, any>();
+    for (const row of existingRows as any[]) {
+      const id = row?.data_id?.toString?.() ?? String(row?.data_id ?? '');
+      if (!id) continue;
+      const master = byMasterDataId.get(id);
+      rowsByDataId.set(id, {
+        ...row,
+        data_id: id,
+        info_type: 'gsc',
+        checklist_order: master?.checklist_order,
+      });
+    }
+
+    for (const row of incomingDoc || []) {
+      const id = row?.data_id?.toString?.() ?? String(row?.data_id ?? '');
+      if (!id) continue;
+      const master = byMasterDataId.get(id);
+      const prev = rowsByDataId.get(id) || {};
+      rowsByDataId.set(id, {
+        ...prev,
+        ...row,
+        data_id: id,
+        info_type: 'gsc',
+        parameter: row?.parameter ?? prev?.parameter ?? master?.parameter,
+        reference_unit: sanitizeUnit(row?.reference_unit ?? prev?.reference_unit ?? master?.reference_unit ?? '-'),
+        checklist_order: master?.checklist_order,
+      });
+    }
+
+    for (const [id, master] of byMasterDataId.entries()) {
+      if (rowsByDataId.has(id)) continue;
+      rowsByDataId.set(id, {
+        data_id: id,
+        info_type: 'gsc',
+        parameter: master?.parameter,
+        reference_unit: sanitizeUnit(master?.reference_unit ?? '-'),
+        checklist_order: master?.checklist_order,
+        fy1: 0,
+        fy2: 0,
+        fy3: 0,
+        fy4: 0,
+        fy5: 0,
+        extrapolated: 0,
+      });
+    }
+
+    const gscRowsForCalc = Array.from(rowsByDataId.values());
+    applyGscCalculationsByOrder({ gsc: gscRowsForCalc });
+
+    const fyOrNa = (v: unknown) => (v === 'N/A' ? 'N/A' : this.toFiniteNumber(v, 0));
+    const expOrNa = (v: unknown) =>
+      v === 'N/A' ? 'N/A' : v != null ? this.toFiniteNumber(v, 0) : undefined;
+
+    return gscRowsForCalc.map((row) => ({
+      data_id: row.data_id,
+      info_type: 'gsc',
+      parameter: row.parameter,
+      reference_unit: sanitizeUnit(row.reference_unit ?? '-'),
+      details: row.details,
+      fy1: fyOrNa(row.fy1),
+      fy2: fyOrNa(row.fy2),
+      fy3: fyOrNa(row.fy3),
+      fy4: fyOrNa(row.fy4),
+      fy5: fyOrNa(row.fy5),
+      extrapolated: expOrNa(row.extrapolated),
+      lt_target: row.lt_target != null ? this.toFiniteNumber(row.lt_target, 0) : undefined,
+      additional_details: row.additional_details,
+    }));
+  }
+
   /**
    * Store Primary Data (field-by-field): update or insert from doc array. No final submit.
    * Accepts doc as array or object keyed by data_id (same shape as /save payload).
@@ -7493,6 +8414,22 @@ export class CompanyProjectsService {
     }
     if (String(section || '').toLowerCase() === 're') {
       const recalculatedDoc = await this.prepareRePayloadForSave(companyId, projectId, []);
+      await this.storePrimaryData(companyId, projectId, recalculatedDoc);
+    }
+    if (String(section || '').toLowerCase() === 'gge') {
+      const recalculatedDoc = await this.prepareGgePayloadForSave(companyId, projectId, []);
+      await this.storePrimaryData(companyId, projectId, recalculatedDoc);
+    }
+    if (String(section || '').toLowerCase() === 'wm') {
+      const recalculatedDoc = await this.prepareWmPayloadForSave(companyId, projectId, []);
+      await this.storePrimaryData(companyId, projectId, recalculatedDoc);
+    }
+    if (String(section || '').toLowerCase() === 'mcr') {
+      const recalculatedDoc = await this.prepareMcrPayloadForSave(companyId, projectId, []);
+      await this.storePrimaryData(companyId, projectId, recalculatedDoc);
+    }
+    if (String(section || '').toLowerCase() === 'gsc') {
+      const recalculatedDoc = await this.prepareGscPayloadForSave(companyId, projectId, []);
       await this.storePrimaryData(companyId, projectId, recalculatedDoc);
     }
     return {

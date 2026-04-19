@@ -47,6 +47,7 @@ import { UpdateQuickviewDataDto } from './dto/update-quickview-data.dto';
 import { ReviewProposalDto } from './dto/review-proposal.dto';
 import { UpdateProposalStatusDto } from './dto/update-proposal-status.dto';
 import { WorkOrderPoDetailsDto } from './dto/work-order-po-details.dto';
+import { FinanceV2InvoiceDto } from './dto/finance-v2-invoice.dto';
 import { mergeNestedRegistrationBody } from './registration-info-normalize';
 
 @Controller('api/company/projects')
@@ -2360,6 +2361,50 @@ export class CompanyProjectsController {
       projectId,
       dto,
       supportingDoc,
+    );
+  }
+
+  /**
+   * Finance v2: create invoice finance metadata (GST/state/amount fields).
+   * POST /api/company/projects/:projectId/finance-v2/invoices
+   * Alias: /api/company/projects/:projectId/finance/v2/invoices
+   */
+  @Post(':projectId/finance-v2/invoices')
+  @Post(':projectId/finance/v2/invoices')
+  @UseGuards(JwtAuthGuard, AccountStatusGuard)
+  @UsePipes(new ValidationPipe({ transform: true, whitelist: true }))
+  async createFinanceV2Invoice(
+    @Request() req,
+    @Param('projectId') projectId: string,
+    @Body() dto: FinanceV2InvoiceDto,
+  ): Promise<any> {
+    return this.companyProjectsService.createFinanceV2Invoice(
+      req.user.userId,
+      projectId,
+      dto,
+    );
+  }
+
+  /**
+   * Finance v2: update invoice finance metadata (GST/state/amount fields).
+   * PATCH /api/company/projects/:projectId/finance-v2/invoices/:invoiceId
+   * Alias: /api/company/projects/:projectId/finance/v2/invoices/:invoiceId
+   */
+  @Patch(':projectId/finance-v2/invoices/:invoiceId')
+  @Patch(':projectId/finance/v2/invoices/:invoiceId')
+  @UseGuards(JwtAuthGuard, AccountStatusGuard)
+  @UsePipes(new ValidationPipe({ transform: true, whitelist: true }))
+  async updateFinanceV2Invoice(
+    @Request() req,
+    @Param('projectId') projectId: string,
+    @Param('invoiceId') invoiceId: string,
+    @Body() dto: FinanceV2InvoiceDto,
+  ): Promise<any> {
+    return this.companyProjectsService.updateFinanceV2Invoice(
+      req.user.userId,
+      projectId,
+      invoiceId,
+      dto,
     );
   }
 

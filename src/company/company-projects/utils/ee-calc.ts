@@ -420,6 +420,30 @@ export function applyWcCalculationsByOrder(
 
 export const RE_CALCULATED_CHECKLIST_ORDERS = [106, 107, 108, 109, 110] as const;
 
+/** Legacy Laravel UI used master row ids 41–48 for some RE rows; canonical checklist_order is 26–110. */
+export const RE_LEGACY_ORDER_TO_CANONICAL: Record<number, number> = {
+  41: 26,
+  43: 105,
+  44: 27,
+  45: 104,
+  46: 109,
+  47: 108,
+  48: 110,
+};
+
+/** GJ → kWh for RE total renewable line (matches RenewableEnergyLibrary.php). */
+const RE_THERMAL_GJ_TO_KWH = 277.78;
+
+function reRowByCanonicalOrder(re: any[], canonicalOrder: number): any {
+  const legacyOrders = Object.entries(RE_LEGACY_ORDER_TO_CANONICAL)
+    .filter(([, c]) => Number(c) === Number(canonicalOrder))
+    .map(([k]) => Number(k));
+  return (re || []).find((r) => {
+    const o = Number(r?.checklist_order);
+    return o === canonicalOrder || legacyOrders.includes(o);
+  });
+}
+
 /**
  * Calculate RE rows in-place by checklist_order (26,103,27,104,105 inputs -> 106..110 calculated).
  * Mirrors RenewableEnergyLibrary behavior and returns issues without throwing.
@@ -432,54 +456,56 @@ export function applyReCalculationsByOrder(
   const ee = rows.ee || [];
   const issues: string[] = [];
 
-  const r26 = byOrder(re, 26); // Total Installed Capacity - Onsite
-  const r103 = byOrder(re, 103); // Total Installed Capacity - Offsite
-  const r27 = byOrder(re, 27); // Actual Electrical Energy Generated - Onsite
-  const r104 = byOrder(re, 104); // Actual Electrical Energy Generated - Offsite
-  const r105 = byOrder(re, 105); // Actual Renewable Thermal Energy Substituted
-  const r106 = byOrder(re, 106); // Total Electrical Energy Generated
-  const r107 = byOrder(re, 107); // Total Renewable Energy Generated
-  const r108 = byOrder(re, 108); // % Substitution with Renewable Energy (Electrical)
-  const r109 = byOrder(re, 109); // % Substitution with Renewable Energy (Thermal)
-  const r110 = byOrder(re, 110); // RE Share in Overall Energy Mix
+  const r26 = reRowByCanonicalOrder(re, 26); // Total Installed Capacity - Onsite
+  const r103 = reRowByCanonicalOrder(re, 103); // Total Installed Capacity - Offsite
+  const r27 = reRowByCanonicalOrder(re, 27); // Actual Electrical Energy Generated - Onsite
+  const r104 = reRowByCanonicalOrder(re, 104); // Actual Electrical Energy Generated - Offsite
+  const r105 = reRowByCanonicalOrder(re, 105); // Actual Renewable Thermal Energy Substituted
+  const r106 = reRowByCanonicalOrder(re, 106); // Total Electrical Energy Generated
+  const r107 = reRowByCanonicalOrder(re, 107); // Total Renewable Energy Generated
+  const r108 = reRowByCanonicalOrder(re, 108); // % Substitution with Renewable Energy (Electrical)
+  const r109 = reRowByCanonicalOrder(re, 109); // % Substitution with Renewable Energy (Thermal)
+  const r110 = reRowByCanonicalOrder(re, 110); // RE Share in Overall Energy Mix
 
   const ee6 = byOrder(ee, 6); // Electrical energy consumption
   const ee7 = byOrder(ee, 7); // Thermal energy consumption
   const ee9 = byOrder(ee, 9); // Total energy consumption
 
-  if (!r26 || !r103 || !r27 || !r104 || !r105) {
-    issues.push('RE calculation requires checklist rows 26, 103, 27, 104, and 105.');
-    return { rows, issues };
-  }
+  if (!r26) issues.push('RE: missing input row for Total Installed Capacity - Onsite (order 26 or legacy 41).');
+  if (!r103) issues.push('RE: missing input row for Total Installed Capacity - Offsite (order 103).');
+  if (!r27) issues.push('RE: missing input row for Actual Electrical Energy Generated - Onsite (order 27 or legacy 44).');
+  if (!r104) issues.push('RE: missing input row for Actual Electrical Energy Generated - Offsite (order 104 or legacy 45).');
+  if (!r105) issues.push('RE: missing input row for Actual Renewable Thermal Energy Substituted (order 105 or legacy 43).');
 
-  if (!ee6) issues.push('RE row 108 depends on EE checklist row 6.');
-  if (!ee7) issues.push('RE row 109 depends on EE checklist row 7.');
-  if (!ee9) issues.push('RE row 110 depends on EE checklist row 9.');
+  if (!ee6) issues.push('RE row 108 depends on EE checklist row 6 (electrical energy consumption).');
+  if (!ee7) issues.push('RE row 109 depends on EE checklist row 7 (thermal energy consumption).');
+  if (!ee9) issues.push('RE row 110 depends on EE checklist row 9 (total energy consumption).');
 
   for (const y of ['fy1', 'fy2', 'fy3', 'fy4', 'exp'] as const) {
-    const onsiteElectrical = yearValue(r27, y);
-    const offsiteElectrical = yearValue(r104, y);
-    const substitutedThermal = yearValue(r105, y);
+    const onsiteElectrical = r27 ? yearValue(r27, y) : 0;
+    const offsiteElectrical = r104 ? yearValue(r104, y) : 0;
+    const substitutedThermal = r105 ? yearValue(r105, y) : 0;
 
     const totalElectrical = onsiteElectrical + offsiteElectrical;
-    const totalRenewable = totalElectrical + substitutedThermal * 277.78;
+    const totalRenewable = totalElectrical + substitutedThermal * RE_THERMAL_GJ_TO_KWH;
 
     if (r106) setYearValue(r106, y, roundTo(totalElectrical));
     if (r107) setYearValue(r107, y, roundTo(totalRenewable));
 
-    if (r108) {
+    // Match PHP: only compute % rows when corresponding EE row exists.
+    if (r108 && ee6) {
       const den = yearValue(ee6, y);
       const v = onsiteElectrical !== 0 && den !== 0 ? roundTo((onsiteElectrical * 100) / den) : 0;
       setYearValue(r108, y, v);
     }
 
-    if (r109) {
+    if (r109 && ee7) {
       const den = yearValue(ee7, y);
       const v = substitutedThermal !== 0 && den !== 0 ? roundTo((substitutedThermal * 100) / den) : 0;
       setYearValue(r109, y, v);
     }
 
-    if (r110) {
+    if (r110 && ee9) {
       const den = yearValue(ee9, y);
       const v = totalRenewable !== 0 && den !== 0 ? roundTo((totalRenewable * 100) / den) : 0;
       setYearValue(r110, y, v);
@@ -496,6 +522,472 @@ export function applyReCalculationsByOrder(
   if (r108) setUnit(r108, '%');
   if (r109) setUnit(r109, '%');
   if (r110) setUnit(r110, '%');
+
+  return { rows, issues };
+}
+
+/** Calculated GGE rows (GreenhouseGasesEmissionsLibrary.php). */
+export const GGE_CALCULATED_CHECKLIST_ORDERS = [
+  139, 116, 117, 118, 119, 120, 123, 124, 128, 129, 130, 131,
+] as const;
+
+/**
+ * Greenhouse gas / emissions tab: inputs 111–114, 121–122, 125–127; derived 139, 116–120, 123–124, 128–131.
+ * Depends on GI row 4 (equivalent product). Mirrors GreenhouseGasesEmissionsLibrary.php.
+ */
+export function applyGgeCalculationsByOrder(
+  primaryDataRows: Record<string, any[]>,
+): { rows: Record<string, any[]>; issues: string[] } {
+  const rows = primaryDataRows || {};
+  const gge = rows.gge || [];
+  const gi = rows.gi || [];
+  const issues: string[] = [];
+
+  const gi4 = byOrder(gi, 4);
+  if (!gi4) {
+    issues.push('GGE calculations require GI equivalent product (checklist_order 4).');
+  }
+
+  const r111 = byOrder(gge, 111);
+  const r112 = byOrder(gge, 112);
+  const r113 = byOrder(gge, 113);
+  const r114 = byOrder(gge, 114);
+  const r121 = byOrder(gge, 121);
+  const r122 = byOrder(gge, 122);
+  const r125 = byOrder(gge, 125);
+  const r126 = byOrder(gge, 126);
+  const r127 = byOrder(gge, 127);
+
+  const r139 = byOrder(gge, 139);
+  const r116 = byOrder(gge, 116);
+  const r117 = byOrder(gge, 117);
+  const r118 = byOrder(gge, 118);
+  const r119 = byOrder(gge, 119);
+  const r120 = byOrder(gge, 120);
+  const r123 = byOrder(gge, 123);
+  const r124 = byOrder(gge, 124);
+  const r128 = byOrder(gge, 128);
+  const r129 = byOrder(gge, 129);
+  const r130 = byOrder(gge, 130);
+  const r131 = byOrder(gge, 131);
+
+  const passUnitFromDetails = (row: any) => {
+    if (!row) return;
+    setUnit(row, sanitizeUnit(row.details || row.reference_unit || '-'));
+  };
+
+  passUnitFromDetails(r111);
+  passUnitFromDetails(r112);
+  passUnitFromDetails(r113);
+  passUnitFromDetails(r114);
+  passUnitFromDetails(r121);
+  passUnitFromDetails(r122);
+  passUnitFromDetails(r125);
+  passUnitFromDetails(r126);
+  passUnitFromDetails(r127);
+
+  // 139 GHG emission intensity (TCO2e/unit)
+  if (r139 && gi4 && r111 && r112) {
+    setUnit(r139, 'TCO2e/unit');
+    for (const y of ['fy1', 'fy2', 'fy3', 'fy4', 'exp'] as const) {
+      const s1 = y === 'exp' ? yearValue(r111, 'exp') : yearValue(r111, y);
+      const s2 = y === 'exp' ? yearValue(r112, 'exp') : yearValue(r112, y);
+      const g = y === 'exp' ? yearValue(gi4, 'exp') : yearValue(gi4, y);
+      const ok = s1 !== 0 && s2 !== 0 && g !== 0;
+      const v = ok ? roundTo((s1 + s2) / g) : 0;
+      setYearValue(r139, y, v);
+    }
+  }
+
+  // 116 reduction in intensity YoY (%)
+  if (r116 && r139) {
+    r116.fy1 = 'N/A';
+    setUnit(r116, '');
+    const y139 = (k: 'fy1' | 'fy2' | 'fy3' | 'fy4' | 'exp') => yearValue(r139, k === 'exp' ? 'exp' : k);
+    r116.fy2 =
+      y139('fy1') !== 0 ? roundTo(((y139('fy1') - y139('fy2')) / y139('fy1')) * 100) : 0;
+    r116.fy3 =
+      y139('fy2') !== 0 ? roundTo(((y139('fy2') - y139('fy3')) / y139('fy2')) * 100) : 0;
+    r116.fy4 =
+      y139('fy3') !== 0 ? roundTo(((y139('fy3') - y139('fy4')) / y139('fy3')) * 100) : 0;
+    const r139fy3 = y139('fy3');
+    const r139exp = y139('exp');
+    setYearValue(
+      r116,
+      'exp',
+      r139fy3 !== 0 && r139exp !== 0 ? roundTo(((r139fy3 - r139exp) / r139fy3) * 100) : 0,
+    );
+  }
+
+  // 117 reduction w.r.t. baseline (%)
+  if (r117 && r139) {
+    r117.fy1 = 'N/A';
+    r117.fy2 = 'N/A';
+    r117.fy3 = 'N/A';
+    setUnit(r117, '');
+    const y139 = (k: 'fy1' | 'fy2' | 'fy3' | 'fy4') => yearValue(r139, k);
+    r117.fy4 =
+      y139('fy1') !== 0
+        ? roundTo(((y139('fy1') - y139('fy4')) * 100) / y139('fy1'))
+        : 0;
+    setYearValue(r117, 'exp', 'N/A');
+  }
+
+  // 118 Scope 3 intensity — PHP unit label KL/unit
+  if (r118 && gi4 && r113) {
+    setUnit(r118, 'KL/unit');
+    for (const y of ['fy1', 'fy2', 'fy3', 'fy4', 'exp'] as const) {
+      const s3 = y === 'exp' ? yearValue(r113, 'exp') : yearValue(r113, y);
+      const g = y === 'exp' ? yearValue(gi4, 'exp') : yearValue(gi4, y);
+      const ok = s3 !== 0 && g !== 0;
+      setYearValue(r118, y, ok ? roundTo(s3 / g) : 0);
+    }
+  }
+
+  // 119 reduction scope 3 intensity YoY
+  if (r119 && r118) {
+    r119.fy1 = 'N/A';
+    setUnit(r119, '');
+    const y118 = (k: 'fy1' | 'fy2' | 'fy3' | 'fy4' | 'exp') => yearValue(r118, k === 'exp' ? 'exp' : k);
+    r119.fy2 =
+      y118('fy1') !== 0 && y118('fy2') !== 0
+        ? roundTo(((y118('fy1') - y118('fy2')) / y118('fy1')) * 100)
+        : 0;
+    r119.fy3 =
+      y118('fy2') !== 0 && y118('fy3') !== 0
+        ? roundTo(((y118('fy2') - y118('fy3')) / y118('fy2')) * 100)
+        : 0;
+    r119.fy4 =
+      y118('fy3') !== 0 && y118('fy4') !== 0
+        ? roundTo(((y118('fy3') - y118('fy4')) / y118('fy3')) * 100)
+        : 0;
+    const fy3 = y118('fy3');
+    const ex = y118('exp');
+    setYearValue(
+      r119,
+      'exp',
+      fy3 !== 0 && ex !== 0 ? roundTo(((fy3 - ex) / fy3) * 100) : 0,
+    );
+  }
+
+  // 120 scope 3 baseline reduction
+  if (r120 && r118) {
+    r120.fy1 = 'N/A';
+    r120.fy2 = 'N/A';
+    r120.fy3 = 'N/A';
+    setUnit(r120, '');
+    const y118 = (k: 'fy1' | 'fy4') => yearValue(r118, k);
+    r120.fy4 =
+      y118('fy1') !== 0 && y118('fy4') !== 0
+        ? roundTo(((y118('fy1') - y118('fy4')) * 100) / y118('fy1'))
+        : 0;
+    setYearValue(r120, 'exp', 'N/A');
+  }
+
+  // 123 = copy scope 3 emissions row (113)
+  if (r123 && r113) {
+    for (const y of ['fy1', 'fy2', 'fy3', 'fy4', 'exp'] as const) {
+      const v = y === 'exp' ? yearValue(r113, 'exp') : yearValue(r113, y);
+      setYearValue(r123, y, v);
+    }
+    setUnit(r123, sanitizeUnit(r113.details || r113.reference_unit || '-'));
+  }
+
+  // 121–122 already pass-through; 124 = 121+122+123
+  if (r124 && r121 && r122 && r123) {
+    setUnit(r124, 'TCO2e');
+    for (const y of ['fy1', 'fy2', 'fy3', 'fy4', 'exp'] as const) {
+      const a = y === 'exp' ? yearValue(r121, 'exp') : yearValue(r121, y);
+      const b = y === 'exp' ? yearValue(r122, 'exp') : yearValue(r122, y);
+      const c = y === 'exp' ? yearValue(r123, 'exp') : yearValue(r123, y);
+      setYearValue(r124, y, roundTo(a + b + c));
+    }
+  }
+
+  // 128 = 125+126+127
+  if (r128 && r125 && r126 && r127) {
+    setUnit(r128, 'TCO2e');
+    for (const y of ['fy1', 'fy2', 'fy3', 'fy4', 'exp'] as const) {
+      const a = y === 'exp' ? yearValue(r125, 'exp') : yearValue(r125, y);
+      const b = y === 'exp' ? yearValue(r126, 'exp') : yearValue(r126, y);
+      const c = y === 'exp' ? yearValue(r127, 'exp') : yearValue(r127, y);
+      setYearValue(r128, y, roundTo(a + b + c));
+    }
+  }
+
+  // 129 net = 124 - 128
+  if (r129 && r124 && r128) {
+    setUnit(r129, '');
+    for (const y of ['fy1', 'fy2', 'fy3', 'fy4', 'exp'] as const) {
+      const t = y === 'exp' ? yearValue(r124, 'exp') : yearValue(r124, y);
+      const o = y === 'exp' ? yearValue(r128, 'exp') : yearValue(r128, y);
+      setYearValue(r129, y, roundTo(t - o));
+    }
+  }
+
+  // 130 % offset vs scope 1+2
+  if (r130 && r128 && r121 && r122) {
+    setUnit(r130, '%');
+    for (const y of ['fy1', 'fy2', 'fy3', 'fy4', 'exp'] as const) {
+      const off = y === 'exp' ? yearValue(r128, 'exp') : yearValue(r128, y);
+      const x = y === 'exp' ? yearValue(r121, 'exp') : yearValue(r121, y);
+      const z = y === 'exp' ? yearValue(r122, 'exp') : yearValue(r122, y);
+      const den = x + z;
+      const ok = off !== 0 && x !== 0 && z !== 0;
+      setYearValue(r130, y, ok ? roundTo((off * 100) / den) : 0);
+    }
+  }
+
+  // 131 % offset vs total 124
+  if (r131 && r128 && r124) {
+    setUnit(r131, '%');
+    for (const y of ['fy1', 'fy2', 'fy3', 'fy4', 'exp'] as const) {
+      const off = y === 'exp' ? yearValue(r128, 'exp') : yearValue(r128, y);
+      const tot = y === 'exp' ? yearValue(r124, 'exp') : yearValue(r124, y);
+      const ok = off !== 0 && tot !== 0;
+      setYearValue(r131, y, ok ? roundTo((off * 100) / tot) : 0);
+    }
+  }
+
+  return { rows, issues };
+}
+
+/** Derived WM rows (WastManagementLibrary.php). */
+export const WM_CALCULATED_CHECKLIST_ORDERS = [138, 132, 133, 134, 135, 136, 47] as const;
+
+/**
+ * Waste management: inputs 44, 46, 137, 49–53; derived 138, 132, 133, 134, 135, 136, 47.
+ * Depends on GI equivalent product (checklist_order 4). Mirrors WastManagementLibrary.php.
+ */
+export function applyWmCalculationsByOrder(
+  primaryDataRows: Record<string, any[]>,
+): { rows: Record<string, any[]>; issues: string[] } {
+  const rows = primaryDataRows || {};
+  const wm = rows.wm || [];
+  const gi = rows.gi || [];
+  const issues: string[] = [];
+
+  const gi4 = byOrder(gi, 4);
+  if (!gi4) {
+    issues.push('WM calculations require GI equivalent product (checklist_order 4).');
+  }
+
+  const r44 = byOrder(wm, 44);
+  const r46 = byOrder(wm, 46);
+  const r137 = byOrder(wm, 137);
+  const r49 = byOrder(wm, 49);
+  const r50 = byOrder(wm, 50);
+  const r51 = byOrder(wm, 51);
+  const r52 = byOrder(wm, 52);
+  const r53 = byOrder(wm, 53);
+
+  const r138 = byOrder(wm, 138);
+  const r132 = byOrder(wm, 132);
+  const r133 = byOrder(wm, 133);
+  const r134 = byOrder(wm, 134);
+  const r135 = byOrder(wm, 135);
+  const r136 = byOrder(wm, 136);
+  const r47 = byOrder(wm, 47);
+
+  const passDetails = (row: any) => {
+    if (!row) return;
+    setUnit(row, sanitizeUnit(row.details || row.reference_unit || '-'));
+  };
+
+  passDetails(r44);
+  passDetails(r46);
+  passDetails(r137);
+  passDetails(r49);
+  passDetails(r50);
+  passDetails(r51);
+  passDetails(r52);
+  passDetails(r53);
+
+  // 138 Specific hazardous waste (Tons/unit)
+  if (r138 && gi4 && r44) {
+    setUnit(r138, 'Tons/unit');
+    for (const y of ['fy1', 'fy2', 'fy3', 'fy4', 'exp'] as const) {
+      const w = y === 'exp' ? yearValue(r44, 'exp') : yearValue(r44, y);
+      const g = y === 'exp' ? yearValue(gi4, 'exp') : yearValue(gi4, y);
+      const ok = w !== 0 && g !== 0;
+      setYearValue(r138, y, ok ? roundTo(w / g) : 0);
+    }
+  }
+
+  // 132 Reduction hazardous YoY — PHP unit string is 'Tons/unit'
+  if (r132 && r138) {
+    r132.fy1 = 'N/A';
+    setUnit(r132, 'Tons/unit');
+    const v = (k: 'fy1' | 'fy2' | 'fy3' | 'fy4' | 'exp') =>
+      yearValue(r138, k === 'exp' ? 'exp' : k);
+    r132.fy2 =
+      v('fy1') !== 0 && v('fy2') !== 0 ? roundTo(((v('fy1') - v('fy2')) / v('fy1')) * 100) : 0;
+    r132.fy3 =
+      v('fy2') !== 0 && v('fy3') !== 0 ? roundTo(((v('fy2') - v('fy3')) / v('fy2')) * 100) : 0;
+    r132.fy4 =
+      v('fy3') !== 0 && v('fy4') !== 0 ? roundTo(((v('fy3') - v('fy4')) / v('fy3')) * 100) : 0;
+    const fy4 = v('fy4');
+    const ex = v('exp');
+    setYearValue(r132, 'exp', fy4 !== 0 && ex !== 0 ? roundTo(((fy4 - ex) / fy4) * 100) : 0);
+  }
+
+  // 133 Hazardous baseline WRT
+  if (r133 && r138) {
+    r133.fy1 = 'N/A';
+    r133.fy2 = 'N/A';
+    r133.fy3 = 'N/A';
+    setUnit(r133, 'Tons/unit');
+    const v = (k: 'fy1' | 'fy4') => yearValue(r138, k);
+    r133.fy4 =
+      v('fy1') !== 0 && v('fy4') !== 0
+        ? roundTo((100 * (v('fy1') - v('fy4'))) / v('fy1'))
+        : 0;
+    setYearValue(r133, 'exp', 'N/A');
+  }
+
+  // 134 Specific non-hazardous (KG/unit)
+  if (r134 && gi4 && r46) {
+    setUnit(r134, 'KG/unit');
+    for (const y of ['fy1', 'fy2', 'fy3', 'fy4', 'exp'] as const) {
+      const w = y === 'exp' ? yearValue(r46, 'exp') : yearValue(r46, y);
+      const g = y === 'exp' ? yearValue(gi4, 'exp') : yearValue(gi4, y);
+      const ok = w !== 0 && g !== 0;
+      setYearValue(r134, y, ok ? roundTo(w / g) : 0);
+    }
+  }
+
+  // 135 Reduction non-hazardous YoY (only if 134 computed — isset in PHP)
+  if (r135 && r134) {
+    r135.fy1 = 'N/A';
+    setUnit(r135, 'KG/unit');
+    const v = (k: 'fy1' | 'fy2' | 'fy3' | 'fy4' | 'exp') =>
+      yearValue(r134, k === 'exp' ? 'exp' : k);
+    r135.fy2 =
+      v('fy1') !== 0 && v('fy2') !== 0 ? roundTo(((v('fy1') - v('fy2')) / v('fy1')) * 100) : 0;
+    r135.fy3 =
+      v('fy2') !== 0 && v('fy3') !== 0 ? roundTo(((v('fy2') - v('fy3')) / v('fy2')) * 100) : 0;
+    r135.fy4 =
+      v('fy3') !== 0 && v('fy4') !== 0 ? roundTo(((v('fy3') - v('fy4')) / v('fy3')) * 100) : 0;
+    const fy4 = v('fy4');
+    const ex = v('exp');
+    setYearValue(r135, 'exp', fy4 !== 0 && ex !== 0 ? roundTo(((fy4 - ex) / fy4) * 100) : 0);
+  }
+
+  // 136 Non-hazardous baseline WRT
+  if (r136 && r134) {
+    r136.fy1 = 'N/A';
+    r136.fy2 = 'N/A';
+    r136.fy3 = 'N/A';
+    setUnit(r136, 'KG/unit');
+    const v = (k: 'fy1' | 'fy4') => yearValue(r134, k);
+    r136.fy4 =
+      v('fy1') !== 0 && v('fy4') !== 0
+        ? roundTo((100 * (v('fy1') - v('fy4'))) / v('fy1'))
+        : 0;
+    setYearValue(r136, 'exp', 'N/A');
+  }
+
+  // 47 Specific process effluent generated = 137 / GI
+  if (r47 && gi4 && r137) {
+    setUnit(r47, 'KG/unit');
+    for (const y of ['fy1', 'fy2', 'fy3', 'fy4', 'exp'] as const) {
+      const p = y === 'exp' ? yearValue(r137, 'exp') : yearValue(r137, y);
+      const g = y === 'exp' ? yearValue(gi4, 'exp') : yearValue(gi4, y);
+      const ok = p !== 0 && g !== 0;
+      setYearValue(r47, y, ok ? roundTo(p / g) : 0);
+    }
+  }
+
+  return { rows, issues };
+}
+
+/** Derived MCR rows (MaterialCalculationLibrary.php): 54, 55, 56 from 99, 98, 97. */
+export const MCR_CALCULATED_CHECKLIST_ORDERS = [54, 55, 56] as const;
+
+/**
+ * Material conservation / recycling: inputs 101, 100, 99, 98, 97, 57; derived 54–56 (YoY % on specific rows).
+ * Mirrors MaterialCalculationLibrary.php (pass-through copies unit from details → reference_unit).
+ */
+export function applyMcrCalculationsByOrder(
+  primaryDataRows: Record<string, any[]>,
+): { rows: Record<string, any[]>; issues: string[] } {
+  const rows = primaryDataRows || {};
+  const mcr = rows.mcr || [];
+  const issues: string[] = [];
+
+  const passFromDetails = (row: any) => {
+    if (!row) return;
+    setUnit(row, sanitizeUnit(row.details || row.reference_unit || '-'));
+  };
+
+  passFromDetails(byOrder(mcr, 101));
+  passFromDetails(byOrder(mcr, 100));
+  passFromDetails(byOrder(mcr, 99));
+  passFromDetails(byOrder(mcr, 98));
+  passFromDetails(byOrder(mcr, 97));
+  passFromDetails(byOrder(mcr, 57));
+
+  const r99 = byOrder(mcr, 99);
+  const r98 = byOrder(mcr, 98);
+  const r97 = byOrder(mcr, 97);
+  const r54 = byOrder(mcr, 54);
+  const r55 = byOrder(mcr, 55);
+  const r56 = byOrder(mcr, 56);
+
+  const fillReduction = (target: any, source: any) => {
+    if (!target || !source) return;
+    target.fy1 = 'N/A';
+    setUnit(target, 'KL/unit');
+    const v = (k: 'fy1' | 'fy2' | 'fy3' | 'fy4' | 'exp') =>
+      yearValue(source, k === 'exp' ? 'exp' : k);
+    target.fy2 =
+      v('fy1') !== 0 && v('fy2') !== 0 ? roundTo(((v('fy1') - v('fy2')) / v('fy1')) * 100) : 0;
+    target.fy3 =
+      v('fy2') !== 0 && v('fy3') !== 0 ? roundTo(((v('fy2') - v('fy3')) / v('fy2')) * 100) : 0;
+    target.fy4 =
+      v('fy3') !== 0 && v('fy4') !== 0 ? roundTo(((v('fy3') - v('fy4')) / v('fy3')) * 100) : 0;
+    const fy4 = v('fy4');
+    const ex = v('exp');
+    setYearValue(target, 'exp', fy4 !== 0 && ex !== 0 ? roundTo(((fy4 - ex) / fy4) * 100) : 0);
+  };
+
+  fillReduction(r54, r99);
+  fillReduction(r55, r98);
+  fillReduction(r56, r97);
+
+  if (r54 && !r99) issues.push('MCR row 54 requires checklist row 99 (specific raw material consumption).');
+  if (r55 && !r98) issues.push('MCR row 55 requires checklist row 98 (specific consumables consumption).');
+  if (r56 && !r97) issues.push('MCR row 56 requires checklist row 97 (specific packaging material consumption).');
+
+  return { rows, issues };
+}
+
+/** GSC checklist orders: pass-through only (GreenSupplyChainLibrary.php). No derived rows. */
+export const GSC_PASS_THROUGH_CHECKLIST_ORDERS = [58, 59, 60, 61, 62, 63, 64, 65, 66, 96] as const;
+
+/** No calculated rows in PHP library; kept for symmetry with GET merge logic. */
+export const GSC_CALCULATED_CHECKLIST_ORDERS = [] as readonly number[];
+
+/**
+ * Green supply chain: copy unit from details → reference_unit for rows 58–66, 96.
+ * Mirrors GreenSupplyChainLibrary.php (no numeric formulas).
+ */
+export function applyGscCalculationsByOrder(
+  primaryDataRows: Record<string, any[]>,
+): { rows: Record<string, any[]>; issues: string[] } {
+  const rows = primaryDataRows || {};
+  const gsc = rows.gsc || [];
+  const issues: string[] = [];
+
+  const passFromDetails = (order: number) => {
+    const row = byOrder(gsc, order);
+    if (!row) return;
+    setUnit(row, sanitizeUnit(row.details || row.reference_unit || '-'));
+  };
+
+  for (const order of GSC_PASS_THROUGH_CHECKLIST_ORDERS) {
+    passFromDetails(order);
+  }
 
   return { rows, issues };
 }

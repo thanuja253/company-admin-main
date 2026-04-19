@@ -34,6 +34,40 @@ export class CompanyInvoice {
   @Prop({ default: 0 })
   total_amount?: number;
 
+  /** GST percentage rates */
+  @Prop({ default: 0 })
+  sgst?: number;
+
+  @Prop({ default: 0 })
+  cgst?: number;
+
+  @Prop({ default: 0 })
+  igst?: number;
+
+  /** GST component amounts */
+  @Prop({ default: 0 })
+  sgst_amt?: number;
+
+  @Prop({ default: 0 })
+  cgst_amt?: number;
+
+  @Prop({ default: 0 })
+  igst_amt?: number;
+
+  /** GST state-code metadata */
+  @Prop()
+  supplier_state_code?: string;
+
+  @Prop()
+  place_of_supply_state_code?: string;
+
+  /** Derived from state codes: intra | inter */
+  @Prop()
+  transaction_type?: string;
+
+  @Prop()
+  is_intra_state?: boolean;
+
   /** 'Online' | 'Offline' */
   @Prop()
   payment_type?: string;

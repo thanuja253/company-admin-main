@@ -31,6 +31,7 @@ loadEnvFileIfPresent();
 const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://localhost:27017/greenco_db';
 const COLL = 'master_primary_data_checklist';
 
+// Legacy Laravel UI also referenced rows 41–48; map: 41→26, 43→105, 44→27, 45→104, 46→109, 47→108, 48→110 (backend resolves these).
 const RE_ROWS = [
   { checklist_order: 26, parameter: 'Total Installed Capacity - Onsite', reference_unit: 'MW', is_calculate: 0 },
   { checklist_order: 103, parameter: 'Total Installed Capacity - Offsite', reference_unit: 'MW', is_calculate: 0 },
