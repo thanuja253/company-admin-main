@@ -991,3 +991,92 @@ export function applyGscCalculationsByOrder(
 
   return { rows, issues };
 }
+
+/** PS checklist orders: pass-through only (ProductStewardshipLibrary.php). */
+export const PS_PASS_THROUGH_CHECKLIST_ORDERS = [67, 68, 69] as const;
+
+export const PS_CALCULATED_CHECKLIST_ORDERS = [] as readonly number[];
+
+/**
+ * Product stewardship: copy unit from details → reference_unit for rows 67–69.
+ * Mirrors ProductStewardshipLibrary.php (no numeric formulas).
+ */
+export function applyPsCalculationsByOrder(
+  primaryDataRows: Record<string, any[]>,
+): { rows: Record<string, any[]>; issues: string[] } {
+  const rows = primaryDataRows || {};
+  const ps = rows.ps || [];
+  const issues: string[] = [];
+
+  const passFromDetails = (order: number) => {
+    const row = byOrder(ps, order);
+    if (!row) return;
+    setUnit(row, sanitizeUnit(row.details || row.reference_unit || '-'));
+  };
+
+  for (const order of PS_PASS_THROUGH_CHECKLIST_ORDERS) {
+    passFromDetails(order);
+  }
+
+  return { rows, issues };
+}
+
+/** GIN checklist orders: pass-through only (GreenInfrastructureLibrary.php). */
+export const GIN_PASS_THROUGH_CHECKLIST_ORDERS = [78, 79, 140, 141] as const;
+
+export const GIN_CALCULATED_CHECKLIST_ORDERS = [] as readonly number[];
+
+/**
+ * Green infrastructure: copy unit from details → reference_unit for rows 78, 79, 140, 141.
+ * Mirrors GreenInfrastructureLibrary.php (no numeric formulas).
+ */
+export function applyGinCalculationsByOrder(
+  primaryDataRows: Record<string, any[]>,
+): { rows: Record<string, any[]>; issues: string[] } {
+  const rows = primaryDataRows || {};
+  const gin = rows.gin || [];
+  const issues: string[] = [];
+
+  const passFromDetails = (order: number) => {
+    const row = byOrder(gin, order);
+    if (!row) return;
+    setUnit(row, sanitizeUnit(row.details || row.reference_unit || '-'));
+  };
+
+  for (const order of GIN_PASS_THROUGH_CHECKLIST_ORDERS) {
+    passFromDetails(order);
+  }
+
+  return { rows, issues };
+}
+
+/** TAR checklist orders: pass-through only (TargetLibrary.php). */
+export const TAR_PASS_THROUGH_CHECKLIST_ORDERS = [
+  80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95,
+] as const;
+
+export const TAR_CALCULATED_CHECKLIST_ORDERS = [] as readonly number[];
+
+/**
+ * Targets: copy unit from details → reference_unit for rows 80–95.
+ * Mirrors TargetLibrary.php (no numeric formulas).
+ */
+export function applyTarCalculationsByOrder(
+  primaryDataRows: Record<string, any[]>,
+): { rows: Record<string, any[]>; issues: string[] } {
+  const rows = primaryDataRows || {};
+  const tar = rows.tar || [];
+  const issues: string[] = [];
+
+  const passFromDetails = (order: number) => {
+    const row = byOrder(tar, order);
+    if (!row) return;
+    setUnit(row, sanitizeUnit(row.details || row.reference_unit || '-'));
+  };
+
+  for (const order of TAR_PASS_THROUGH_CHECKLIST_ORDERS) {
+    passFromDetails(order);
+  }
+
+  return { rows, issues };
+}

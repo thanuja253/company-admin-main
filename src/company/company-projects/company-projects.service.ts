@@ -75,6 +75,12 @@ import {
   applyMcrCalculationsByOrder,
   GSC_CALCULATED_CHECKLIST_ORDERS,
   applyGscCalculationsByOrder,
+  PS_CALCULATED_CHECKLIST_ORDERS,
+  applyPsCalculationsByOrder,
+  GIN_CALCULATED_CHECKLIST_ORDERS,
+  applyGinCalculationsByOrder,
+  TAR_CALCULATED_CHECKLIST_ORDERS,
+  applyTarCalculationsByOrder,
 } from './utils/ee-calc';
 
 function parseUtcCalendarDateFromYmd(input: string): Date {
@@ -6660,6 +6666,45 @@ export class CompanyProjectsService {
     }
     Object.assign(primary_data_rows, gscRowsCalculated);
 
+    // PS in-place (ProductStewardshipLibrary — pass-through unit from details for 67–69).
+    const { rows: psRowsCalculated, issues: psCalculationIssues } = applyPsCalculationsByOrder(primary_data_rows);
+    const psCalculatedOrderSet = new Set<number>(PS_CALCULATED_CHECKLIST_ORDERS as unknown as number[]);
+    if (Array.isArray(psRowsCalculated.ps)) {
+      psRowsCalculated.ps = psRowsCalculated.ps.sort((a, b) => Number(a?.checklist_order || 0) - Number(b?.checklist_order || 0));
+      const existingPsOrders = new Set(psRowsCalculated.ps.map((r) => Number(r?.checklist_order)));
+      const missingPsCalc = (primary_data_rows.ps || []).filter(
+        (r) => psCalculatedOrderSet.has(Number(r?.checklist_order)) && !existingPsOrders.has(Number(r?.checklist_order)),
+      );
+      if (missingPsCalc.length) psRowsCalculated.ps = [...psRowsCalculated.ps, ...missingPsCalc];
+    }
+    Object.assign(primary_data_rows, psRowsCalculated);
+
+    // GIN in-place (GreenInfrastructureLibrary — pass-through unit from details for 78, 79, 140, 141).
+    const { rows: ginRowsCalculated, issues: ginCalculationIssues } = applyGinCalculationsByOrder(primary_data_rows);
+    const ginCalculatedOrderSet = new Set<number>(GIN_CALCULATED_CHECKLIST_ORDERS as unknown as number[]);
+    if (Array.isArray(ginRowsCalculated.gin)) {
+      ginRowsCalculated.gin = ginRowsCalculated.gin.sort((a, b) => Number(a?.checklist_order || 0) - Number(b?.checklist_order || 0));
+      const existingGinOrders = new Set(ginRowsCalculated.gin.map((r) => Number(r?.checklist_order)));
+      const missingGinCalc = (primary_data_rows.gin || []).filter(
+        (r) => ginCalculatedOrderSet.has(Number(r?.checklist_order)) && !existingGinOrders.has(Number(r?.checklist_order)),
+      );
+      if (missingGinCalc.length) ginRowsCalculated.gin = [...ginRowsCalculated.gin, ...missingGinCalc];
+    }
+    Object.assign(primary_data_rows, ginRowsCalculated);
+
+    // TAR in-place (TargetLibrary — pass-through unit from details for 80–95).
+    const { rows: tarRowsCalculated, issues: tarCalculationIssues } = applyTarCalculationsByOrder(primary_data_rows);
+    const tarCalculatedOrderSet = new Set<number>(TAR_CALCULATED_CHECKLIST_ORDERS as unknown as number[]);
+    if (Array.isArray(tarRowsCalculated.tar)) {
+      tarRowsCalculated.tar = tarRowsCalculated.tar.sort((a, b) => Number(a?.checklist_order || 0) - Number(b?.checklist_order || 0));
+      const existingTarOrders = new Set(tarRowsCalculated.tar.map((r) => Number(r?.checklist_order)));
+      const missingTarCalc = (primary_data_rows.tar || []).filter(
+        (r) => tarCalculatedOrderSet.has(Number(r?.checklist_order)) && !existingTarOrders.has(Number(r?.checklist_order)),
+      );
+      if (missingTarCalc.length) tarRowsCalculated.tar = [...tarRowsCalculated.tar, ...missingTarCalc];
+    }
+    Object.assign(primary_data_rows, tarRowsCalculated);
+
     return {
       status: 'success',
       message: 'Primary data form retrieved',
@@ -6678,6 +6723,9 @@ export class CompanyProjectsService {
         wm_calculation_issues: wmCalculationIssues,
         mcr_calculation_issues: mcrCalculationIssues,
         gsc_calculation_issues: gscCalculationIssues,
+        ps_calculation_issues: psCalculationIssues,
+        gin_calculation_issues: ginCalculationIssues,
+        tar_calculation_issues: tarCalculationIssues,
         document_status_labels: this.getPrimaryDataDocStatusLabels(),
         sections,
       },
@@ -6819,6 +6867,15 @@ export class CompanyProjectsService {
     }
     if (String(formType || '').toLowerCase() === 'gsc') {
       doc = await this.prepareGscPayloadForSave(companyId, projectId, doc);
+    }
+    if (String(formType || '').toLowerCase() === 'ps') {
+      doc = await this.preparePsPayloadForSave(companyId, projectId, doc);
+    }
+    if (String(formType || '').toLowerCase() === 'gin') {
+      doc = await this.prepareGinPayloadForSave(companyId, projectId, doc);
+    }
+    if (String(formType || '').toLowerCase() === 'tar') {
+      doc = await this.prepareTarPayloadForSave(companyId, projectId, doc);
     }
     if (finalSubmit) {
       return this.submitPrimaryData(companyId, projectId, doc.length ? doc : []);
@@ -7950,6 +8007,276 @@ export class CompanyProjectsService {
     }));
   }
 
+  private async preparePsPayloadForSave(companyId: string, projectId: string, incomingDoc: any[]): Promise<any[]> {
+    const mongoose = require('mongoose');
+    const pId = new mongoose.Types.ObjectId(projectId);
+
+    const [masterRows, existingRows] = await Promise.all([
+      this.masterPrimaryDataChecklistModel
+        .find({ info_type: 'ps', is_active: 1 })
+        .sort({ checklist_order: 1 })
+        .lean(),
+      this.primaryDataFormModel
+        .find({ company_id: companyId, project_id: pId, info_type: 'ps' })
+        .lean(),
+    ]);
+
+    const byMasterDataId = new Map<string, any>();
+    for (const m of masterRows as any[]) {
+      const id = m?._id?.toString?.() ?? String(m?._id ?? '');
+      byMasterDataId.set(id, m);
+    }
+
+    const rowsByDataId = new Map<string, any>();
+    for (const row of existingRows as any[]) {
+      const id = row?.data_id?.toString?.() ?? String(row?.data_id ?? '');
+      if (!id) continue;
+      const master = byMasterDataId.get(id);
+      rowsByDataId.set(id, {
+        ...row,
+        data_id: id,
+        info_type: 'ps',
+        checklist_order: master?.checklist_order,
+      });
+    }
+
+    for (const row of incomingDoc || []) {
+      const id = row?.data_id?.toString?.() ?? String(row?.data_id ?? '');
+      if (!id) continue;
+      const master = byMasterDataId.get(id);
+      const prev = rowsByDataId.get(id) || {};
+      rowsByDataId.set(id, {
+        ...prev,
+        ...row,
+        data_id: id,
+        info_type: 'ps',
+        parameter: row?.parameter ?? prev?.parameter ?? master?.parameter,
+        reference_unit: sanitizeUnit(row?.reference_unit ?? prev?.reference_unit ?? master?.reference_unit ?? '-'),
+        checklist_order: master?.checklist_order,
+      });
+    }
+
+    for (const [id, master] of byMasterDataId.entries()) {
+      if (rowsByDataId.has(id)) continue;
+      rowsByDataId.set(id, {
+        data_id: id,
+        info_type: 'ps',
+        parameter: master?.parameter,
+        reference_unit: sanitizeUnit(master?.reference_unit ?? '-'),
+        checklist_order: master?.checklist_order,
+        fy1: 0,
+        fy2: 0,
+        fy3: 0,
+        fy4: 0,
+        fy5: 0,
+        extrapolated: 0,
+      });
+    }
+
+    const psRowsForCalc = Array.from(rowsByDataId.values());
+    applyPsCalculationsByOrder({ ps: psRowsForCalc });
+
+    const fyOrNa = (v: unknown) => (v === 'N/A' ? 'N/A' : this.toFiniteNumber(v, 0));
+    const expOrNa = (v: unknown) =>
+      v === 'N/A' ? 'N/A' : v != null ? this.toFiniteNumber(v, 0) : undefined;
+
+    return psRowsForCalc.map((row) => ({
+      data_id: row.data_id,
+      info_type: 'ps',
+      parameter: row.parameter,
+      reference_unit: sanitizeUnit(row.reference_unit ?? '-'),
+      details: row.details,
+      fy1: fyOrNa(row.fy1),
+      fy2: fyOrNa(row.fy2),
+      fy3: fyOrNa(row.fy3),
+      fy4: fyOrNa(row.fy4),
+      fy5: fyOrNa(row.fy5),
+      extrapolated: expOrNa(row.extrapolated),
+      lt_target: row.lt_target != null ? this.toFiniteNumber(row.lt_target, 0) : undefined,
+      additional_details: row.additional_details,
+    }));
+  }
+
+  private async prepareGinPayloadForSave(companyId: string, projectId: string, incomingDoc: any[]): Promise<any[]> {
+    const mongoose = require('mongoose');
+    const pId = new mongoose.Types.ObjectId(projectId);
+
+    const [masterRows, existingRows] = await Promise.all([
+      this.masterPrimaryDataChecklistModel
+        .find({ info_type: 'gin', is_active: 1 })
+        .sort({ checklist_order: 1 })
+        .lean(),
+      this.primaryDataFormModel
+        .find({ company_id: companyId, project_id: pId, info_type: 'gin' })
+        .lean(),
+    ]);
+
+    const byMasterDataId = new Map<string, any>();
+    for (const m of masterRows as any[]) {
+      const id = m?._id?.toString?.() ?? String(m?._id ?? '');
+      byMasterDataId.set(id, m);
+    }
+
+    const rowsByDataId = new Map<string, any>();
+    for (const row of existingRows as any[]) {
+      const id = row?.data_id?.toString?.() ?? String(row?.data_id ?? '');
+      if (!id) continue;
+      const master = byMasterDataId.get(id);
+      rowsByDataId.set(id, {
+        ...row,
+        data_id: id,
+        info_type: 'gin',
+        checklist_order: master?.checklist_order,
+      });
+    }
+
+    for (const row of incomingDoc || []) {
+      const id = row?.data_id?.toString?.() ?? String(row?.data_id ?? '');
+      if (!id) continue;
+      const master = byMasterDataId.get(id);
+      const prev = rowsByDataId.get(id) || {};
+      rowsByDataId.set(id, {
+        ...prev,
+        ...row,
+        data_id: id,
+        info_type: 'gin',
+        parameter: row?.parameter ?? prev?.parameter ?? master?.parameter,
+        reference_unit: sanitizeUnit(row?.reference_unit ?? prev?.reference_unit ?? master?.reference_unit ?? '-'),
+        checklist_order: master?.checklist_order,
+      });
+    }
+
+    for (const [id, master] of byMasterDataId.entries()) {
+      if (rowsByDataId.has(id)) continue;
+      rowsByDataId.set(id, {
+        data_id: id,
+        info_type: 'gin',
+        parameter: master?.parameter,
+        reference_unit: sanitizeUnit(master?.reference_unit ?? '-'),
+        checklist_order: master?.checklist_order,
+        fy1: 0,
+        fy2: 0,
+        fy3: 0,
+        fy4: 0,
+        fy5: 0,
+        extrapolated: 0,
+      });
+    }
+
+    const ginRowsForCalc = Array.from(rowsByDataId.values());
+    applyGinCalculationsByOrder({ gin: ginRowsForCalc });
+
+    const fyOrNa = (v: unknown) => (v === 'N/A' ? 'N/A' : this.toFiniteNumber(v, 0));
+    const expOrNa = (v: unknown) =>
+      v === 'N/A' ? 'N/A' : v != null ? this.toFiniteNumber(v, 0) : undefined;
+
+    return ginRowsForCalc.map((row) => ({
+      data_id: row.data_id,
+      info_type: 'gin',
+      parameter: row.parameter,
+      reference_unit: sanitizeUnit(row.reference_unit ?? '-'),
+      details: row.details,
+      fy1: fyOrNa(row.fy1),
+      fy2: fyOrNa(row.fy2),
+      fy3: fyOrNa(row.fy3),
+      fy4: fyOrNa(row.fy4),
+      fy5: fyOrNa(row.fy5),
+      extrapolated: expOrNa(row.extrapolated),
+      lt_target: row.lt_target != null ? this.toFiniteNumber(row.lt_target, 0) : undefined,
+      additional_details: row.additional_details,
+    }));
+  }
+
+  private async prepareTarPayloadForSave(companyId: string, projectId: string, incomingDoc: any[]): Promise<any[]> {
+    const mongoose = require('mongoose');
+    const pId = new mongoose.Types.ObjectId(projectId);
+
+    const [masterRows, existingRows] = await Promise.all([
+      this.masterPrimaryDataChecklistModel
+        .find({ info_type: 'tar', is_active: 1 })
+        .sort({ checklist_order: 1 })
+        .lean(),
+      this.primaryDataFormModel
+        .find({ company_id: companyId, project_id: pId, info_type: 'tar' })
+        .lean(),
+    ]);
+
+    const byMasterDataId = new Map<string, any>();
+    for (const m of masterRows as any[]) {
+      const id = m?._id?.toString?.() ?? String(m?._id ?? '');
+      byMasterDataId.set(id, m);
+    }
+
+    const rowsByDataId = new Map<string, any>();
+    for (const row of existingRows as any[]) {
+      const id = row?.data_id?.toString?.() ?? String(row?.data_id ?? '');
+      if (!id) continue;
+      const master = byMasterDataId.get(id);
+      rowsByDataId.set(id, {
+        ...row,
+        data_id: id,
+        info_type: 'tar',
+        checklist_order: master?.checklist_order,
+      });
+    }
+
+    for (const row of incomingDoc || []) {
+      const id = row?.data_id?.toString?.() ?? String(row?.data_id ?? '');
+      if (!id) continue;
+      const master = byMasterDataId.get(id);
+      const prev = rowsByDataId.get(id) || {};
+      rowsByDataId.set(id, {
+        ...prev,
+        ...row,
+        data_id: id,
+        info_type: 'tar',
+        parameter: row?.parameter ?? prev?.parameter ?? master?.parameter,
+        reference_unit: sanitizeUnit(row?.reference_unit ?? prev?.reference_unit ?? master?.reference_unit ?? '-'),
+        checklist_order: master?.checklist_order,
+      });
+    }
+
+    for (const [id, master] of byMasterDataId.entries()) {
+      if (rowsByDataId.has(id)) continue;
+      rowsByDataId.set(id, {
+        data_id: id,
+        info_type: 'tar',
+        parameter: master?.parameter,
+        reference_unit: sanitizeUnit(master?.reference_unit ?? '-'),
+        checklist_order: master?.checklist_order,
+        fy1: 0,
+        fy2: 0,
+        fy3: 0,
+        fy4: 0,
+        fy5: 0,
+        extrapolated: 0,
+      });
+    }
+
+    const tarRowsForCalc = Array.from(rowsByDataId.values());
+    applyTarCalculationsByOrder({ tar: tarRowsForCalc });
+
+    const fyOrNa = (v: unknown) => (v === 'N/A' ? 'N/A' : this.toFiniteNumber(v, 0));
+    const expOrNa = (v: unknown) =>
+      v === 'N/A' ? 'N/A' : v != null ? this.toFiniteNumber(v, 0) : undefined;
+
+    return tarRowsForCalc.map((row) => ({
+      data_id: row.data_id,
+      info_type: 'tar',
+      parameter: row.parameter,
+      reference_unit: sanitizeUnit(row.reference_unit ?? '-'),
+      details: row.details,
+      fy1: fyOrNa(row.fy1),
+      fy2: fyOrNa(row.fy2),
+      fy3: fyOrNa(row.fy3),
+      fy4: fyOrNa(row.fy4),
+      fy5: fyOrNa(row.fy5),
+      extrapolated: expOrNa(row.extrapolated),
+      lt_target: row.lt_target != null ? this.toFiniteNumber(row.lt_target, 0) : undefined,
+      additional_details: row.additional_details,
+    }));
+  }
+
   /**
    * Store Primary Data (field-by-field): update or insert from doc array. No final submit.
    * Accepts doc as array or object keyed by data_id (same shape as /save payload).
@@ -8430,6 +8757,18 @@ export class CompanyProjectsService {
     }
     if (String(section || '').toLowerCase() === 'gsc') {
       const recalculatedDoc = await this.prepareGscPayloadForSave(companyId, projectId, []);
+      await this.storePrimaryData(companyId, projectId, recalculatedDoc);
+    }
+    if (String(section || '').toLowerCase() === 'ps') {
+      const recalculatedDoc = await this.preparePsPayloadForSave(companyId, projectId, []);
+      await this.storePrimaryData(companyId, projectId, recalculatedDoc);
+    }
+    if (String(section || '').toLowerCase() === 'gin') {
+      const recalculatedDoc = await this.prepareGinPayloadForSave(companyId, projectId, []);
+      await this.storePrimaryData(companyId, projectId, recalculatedDoc);
+    }
+    if (String(section || '').toLowerCase() === 'tar') {
+      const recalculatedDoc = await this.prepareTarPayloadForSave(companyId, projectId, []);
       await this.storePrimaryData(companyId, projectId, recalculatedDoc);
     }
     return {
