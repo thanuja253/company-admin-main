@@ -6959,6 +6959,17 @@ export class CompanyProjectsService {
     return raw;
   }
 
+  private normalizeYesNoValue(value: unknown): string | undefined {
+    if (value == null) return undefined;
+    if (typeof value === 'boolean') return value ? 'Yes' : 'No';
+    if (typeof value !== 'string') return undefined;
+    const s = value.trim().toLowerCase();
+    if (!s) return undefined;
+    if (['yes', 'y', 'true'].includes(s)) return 'Yes';
+    if (['no', 'n', 'false'].includes(s)) return 'No';
+    return undefined;
+  }
+
   private findEeRow(
     masterRows: any[],
     rowsByDataId: Map<string, any>,
@@ -7752,7 +7763,12 @@ export class CompanyProjectsService {
     const ggeRowsForCalc = Array.from(rowsByDataId.values());
     applyGgeCalculationsByOrder({ gge: ggeRowsForCalc, gi: giRowsForCalc });
 
-    const fyOrNa = (v: unknown) => (v === 'N/A' ? 'N/A' : this.toFiniteNumber(v, 0));
+    const fyOrNa = (v: unknown) => {
+      if (v === 'N/A') return 'N/A';
+      const yn = this.normalizeYesNoValue(v);
+      if (yn) return yn;
+      return this.toFiniteNumber(v, 0);
+    };
     const expOrNa = (v: unknown) =>
       v === 'N/A' ? 'N/A' : v != null ? this.toFiniteNumber(v, 0) : undefined;
 
@@ -7869,7 +7885,12 @@ export class CompanyProjectsService {
     const wmRowsForCalc = Array.from(rowsByDataId.values());
     applyWmCalculationsByOrder({ wm: wmRowsForCalc, gi: giRowsForCalc });
 
-    const fyOrNa = (v: unknown) => (v === 'N/A' ? 'N/A' : this.toFiniteNumber(v, 0));
+    const fyOrNa = (v: unknown) => {
+      if (v === 'N/A') return 'N/A';
+      const yn = this.normalizeYesNoValue(v);
+      if (yn) return yn;
+      return this.toFiniteNumber(v, 0);
+    };
     const expOrNa = (v: unknown) =>
       v === 'N/A' ? 'N/A' : v != null ? this.toFiniteNumber(v, 0) : undefined;
 
@@ -8361,6 +8382,19 @@ export class CompanyProjectsService {
 
     const toNum = (v: unknown): number | undefined =>
       v === '' || v == null ? undefined : (Number.isFinite(Number(v)) ? Number(v) : undefined);
+    const isYesNoRow = (item: any): boolean => {
+      const unitText = this.normalizeText(item?.reference_unit ?? item?.details ?? '');
+      return unitText === 'yes' || unitText === 'no' || unitText === 'yes no';
+    };
+    const toStoredFyValue = (item: any, value: unknown): string | number => {
+      if (value === 'N/A') return 'N/A';
+      if (isYesNoRow(item)) {
+        const yn = this.normalizeYesNoValue(value);
+        if (yn) return yn;
+        if (value == null || value === '') return '';
+      }
+      return toNum(value) ?? 0;
+    };
 
     const items: any[] = Array.isArray(doc)
       ? doc
@@ -8419,11 +8453,11 @@ export class CompanyProjectsService {
         gi_category: item.gi_category,
         reference_unit: sanitizeUnit(item.reference_unit ?? '-'),
         details: item.details,
-        fy1: toNum(item.fy1) ?? 0,
-        fy2: toNum(item.fy2) ?? 0,
-        fy3: toNum(item.fy3) ?? 0,
-        fy4: toNum(item.fy4) ?? 0,
-        fy5: toNum(item.fy5) ?? 0,
+        fy1: toStoredFyValue(item, item.fy1),
+        fy2: toStoredFyValue(item, item.fy2),
+        fy3: toStoredFyValue(item, item.fy3),
+        fy4: toStoredFyValue(item, item.fy4),
+        fy5: toStoredFyValue(item, item.fy5),
         extrapolated: toNum(item.extrapolated),
         lt_target: toNum(item.lt_target),
         additional_details: item.additional_details,

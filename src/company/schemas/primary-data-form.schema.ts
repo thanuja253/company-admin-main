@@ -43,26 +43,26 @@ export class PrimaryDataForm {
   @Prop()
   details?: string;
 
-  @Prop({ default: 0 })
-  fy1?: number;
+  @Prop({ type: MongooseSchema.Types.Mixed, default: 0 })
+  fy1?: any;
 
-  @Prop({ default: 0 })
-  fy2?: number;
+  @Prop({ type: MongooseSchema.Types.Mixed, default: 0 })
+  fy2?: any;
 
-  @Prop({ default: 0 })
-  fy3?: number;
+  @Prop({ type: MongooseSchema.Types.Mixed, default: 0 })
+  fy3?: any;
 
-  @Prop({ default: 0 })
-  fy4?: number;
+  @Prop({ type: MongooseSchema.Types.Mixed, default: 0 })
+  fy4?: any;
 
-  @Prop({ default: 0 })
-  fy5?: number;
+  @Prop({ type: MongooseSchema.Types.Mixed, default: 0 })
+  fy5?: any;
 
-  @Prop()
-  extrapolated?: number;
+  @Prop({ type: MongooseSchema.Types.Mixed })
+  extrapolated?: any;
 
-  @Prop()
-  lt_target?: number;
+  @Prop({ type: MongooseSchema.Types.Mixed })
+  lt_target?: any;
 
   @Prop()
   document?: string;
