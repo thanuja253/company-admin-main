@@ -6762,6 +6762,165 @@ export class CompanyProjectsService {
   ) {
     const requestedFormType = formType && String(formType).trim() ? String(formType).trim() : 'gi';
     const infoType = this.normalizePrimaryDataFormType(requestedFormType);
+
+    // Backward-compatible "all" flow: accept payload grouped by section keys
+    // or a flat object keyed by data_id/checklist identifiers across all sections.
+    if (infoType === 'all') {
+      const allMasters = await this.masterPrimaryDataChecklistModel
+        .find({ is_active: 1 })
+        .sort({ checklist_order: 1 })
+        .lean();
+      const sectionCodes = [...new Set((allMasters as any[]).map((m) => String(m?.info_type || '')).filter(Boolean))];
+
+      if (Array.isArray(payload)) {
+        await this.storePrimaryData(companyId, projectId, payload);
+        if (finalSubmit) return this.submitPrimaryData(companyId, projectId, []);
+        return { status: 'success', message: 'Success! Primary Data Updated.' };
+      }
+
+      const payloadObj =
+        payload && typeof payload === 'object' && !Array.isArray(payload) ? payload : {};
+      if (Array.isArray((payloadObj as any).doc)) {
+        await this.storePrimaryData(companyId, projectId, (payloadObj as any).doc);
+        if (finalSubmit) return this.submitPrimaryData(companyId, projectId, []);
+        return { status: 'success', message: 'Success! Primary Data Updated.' };
+      }
+      const allPayload =
+        payloadObj.data && typeof payloadObj.data === 'object' && !Array.isArray(payloadObj.data)
+          ? payloadObj.data
+          : payloadObj.all && typeof payloadObj.all === 'object' && !Array.isArray(payloadObj.all)
+            ? payloadObj.all
+            : payloadObj;
+      if (Array.isArray((allPayload as any).doc)) {
+        await this.storePrimaryData(companyId, projectId, (allPayload as any).doc);
+        if (finalSubmit) return this.submitPrimaryData(companyId, projectId, []);
+        return { status: 'success', message: 'Success! Primary Data Updated.' };
+      }
+
+      const normalizeSectionKey = (key: string): string => this.normalizePrimaryDataFormType(key);
+      const normalizedSectionPayload: Record<string, any> = {};
+      for (const [key, value] of Object.entries(allPayload || {})) {
+        const normalized = normalizeSectionKey(String(key));
+        normalizedSectionPayload[normalized] = value;
+      }
+
+      const hasSectionKeys = sectionCodes.some((s) => normalizedSectionPayload[s] != null);
+      if (hasSectionKeys) {
+        for (const s of sectionCodes) {
+          if (normalizedSectionPayload[s] == null) continue;
+          const sectionPayload =
+            normalizedSectionPayload[s] &&
+            typeof normalizedSectionPayload[s] === 'object' &&
+            !Array.isArray(normalizedSectionPayload[s]) &&
+            (normalizedSectionPayload[s] as any).data &&
+            typeof (normalizedSectionPayload[s] as any).data === 'object' &&
+            !Array.isArray((normalizedSectionPayload[s] as any).data)
+              ? (normalizedSectionPayload[s] as any).data
+              : normalizedSectionPayload[s];
+          await this.savePrimaryDataBySection(companyId, projectId, s, sectionPayload, false);
+        }
+        if (finalSubmit) return this.submitPrimaryData(companyId, projectId, []);
+        return { status: 'success', message: 'Success! Primary Data Updated.' };
+      }
+
+      // Flat object mode: resolve rows against all active masters.
+      const doc: any[] = [];
+      const masterById = new Map<string, any>();
+      for (const m of allMasters as any[]) {
+        const id = m?._id?.toString?.() ?? String(m?._id ?? '');
+        if (!id) continue;
+        masterById.set(id, m);
+      }
+      for (const m of allMasters as any[]) {
+        const dataId = m?._id?.toString?.() ?? String(m?._id ?? '');
+        const checklistOrderKey = String(m?.checklist_order ?? '');
+        const sectionRow =
+          allPayload[dataId] ??
+          (checklistOrderKey ? allPayload[checklistOrderKey] : undefined) ??
+          allPayload[m?.parameter] ??
+          allPayload[m?.checklist_name];
+        if (sectionRow == null) continue;
+        doc.push({
+          data_id: dataId,
+          info_type: m?.info_type,
+          parameter: m?.parameter,
+          category: sectionRow?.category ?? m?.category,
+          gi_category: sectionRow?.gi_category ?? m?.gi_category,
+          reference_unit: sanitizeUnit(sectionRow?.reference_unit ?? m?.reference_unit ?? '-'),
+          details: sectionRow?.details,
+          fy1: sectionRow?.fy1 ?? 0,
+          fy2: sectionRow?.fy2 ?? 0,
+          fy3: sectionRow?.fy3 ?? 0,
+          fy4: sectionRow?.fy4 ?? 0,
+          fy5: sectionRow?.fy5 ?? 0,
+          extrapolated: sectionRow?.extrapolated,
+          lt_target: sectionRow?.lt_target,
+          additional_details: sectionRow?.additional_details,
+        });
+      }
+
+      if (!doc.length && Object.keys(allPayload).length) {
+        // Deep fallback for heavily wrapped frontend payloads:
+        // extract row objects by data_id property or 24-hex object-id keys anywhere in payload.
+        const extractedById = new Map<string, any>();
+        const visit = (node: any) => {
+          if (node == null) return;
+          if (Array.isArray(node)) {
+            for (const item of node) visit(item);
+            return;
+          }
+          if (typeof node !== 'object') return;
+
+          const rowDataId = node?.data_id?.toString?.() ?? String(node?.data_id ?? '');
+          if (rowDataId && Types.ObjectId.isValid(rowDataId)) {
+            extractedById.set(rowDataId, { ...node, data_id: rowDataId });
+          }
+
+          for (const [k, v] of Object.entries(node)) {
+            if (/^[a-fA-F0-9]{24}$/.test(k) && v && typeof v === 'object' && !Array.isArray(v)) {
+              extractedById.set(k, { ...(v as any), data_id: k });
+            }
+            visit(v);
+          }
+        };
+        visit(allPayload);
+
+        for (const [dataId, sectionRow] of extractedById.entries()) {
+          const master = masterById.get(dataId);
+          if (!master) continue;
+          doc.push({
+            data_id: dataId,
+            info_type: master?.info_type,
+            parameter: sectionRow?.parameter ?? master?.parameter,
+            category: sectionRow?.category ?? master?.category,
+            gi_category: sectionRow?.gi_category ?? master?.gi_category,
+            reference_unit: sanitizeUnit(sectionRow?.reference_unit ?? master?.reference_unit ?? '-'),
+            details: sectionRow?.details,
+            fy1: sectionRow?.fy1 ?? 0,
+            fy2: sectionRow?.fy2 ?? 0,
+            fy3: sectionRow?.fy3 ?? 0,
+            fy4: sectionRow?.fy4 ?? 0,
+            fy5: sectionRow?.fy5 ?? 0,
+            extrapolated: sectionRow?.extrapolated,
+            lt_target: sectionRow?.lt_target,
+            additional_details: sectionRow?.additional_details,
+          });
+        }
+      }
+
+      if (!doc.length && Object.keys(allPayload).length) {
+        throw new BadRequestException({
+          status: 'error',
+          message:
+            'No rows matched for form_type "all". Use section keys or data_id/checklist_order keys from GET /primary-data.',
+        });
+      }
+
+      await this.storePrimaryData(companyId, projectId, doc);
+      if (finalSubmit) return this.submitPrimaryData(companyId, projectId, []);
+      return { status: 'success', message: 'Success! Primary Data Updated.' };
+    }
+
     let masterRowsCache: any[] | null = null;
     const getMasterRows = async () => {
       if (masterRowsCache) return masterRowsCache;
