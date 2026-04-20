@@ -1,6 +1,7 @@
 import { Body, Controller, Get, Param, Patch, Post, UseGuards } from '@nestjs/common';
 import { CompanyProjectsService } from './company-projects.service';
 import { AdminJwtAuthGuard } from '../../admin/admin-auth/guards/admin-jwt-auth.guard';
+import { PrimaryDataSectionReviewDto } from './dto/primary-data-review.dto';
 
 /**
  * Admin dashboard routes under `/api/admin/projects` (and legacy `/admin/projects` for proxies).
@@ -48,6 +49,16 @@ export class AdminProjectsController {
   }
 
   /**
+   * Primary-data section review state only (`section_reviews` + labels; no full form rows).
+   * GET /api/admin/projects/:projectId/primary-data/review
+   * No admin JWT guard (portal callers use this path).
+   */
+  @Get(':projectId/primary-data/review')
+  async getPrimaryDataSectionReviews(@Param('projectId') projectId: string): Promise<any> {
+    return this.companyProjectsService.getPrimaryDataSectionReviewsForAdmin(projectId);
+  }
+
+  /**
    * Admin: Primary Data (same payload as company endpoint).
    * GET /api/admin/projects/:projectId/primary-data
    * Legacy: GET /admin/projects/:projectId/primary-data
@@ -56,6 +67,24 @@ export class AdminProjectsController {
   @UseGuards(AdminJwtAuthGuard)
   async getPrimaryDataForAdmin(@Param('projectId') projectId: string): Promise<any> {
     return this.companyProjectsService.getPrimaryDataForAdmin(projectId);
+  }
+
+  /**
+   * Admin: review one primary-data section (accepted/rejected/under_review).
+   * PATCH /api/admin/projects/:projectId/primary-data/review
+   * No admin JWT guard (portal callers use this path).
+   */
+  @Patch(':projectId/primary-data/review')
+  async reviewPrimaryDataSection(
+    @Param('projectId') projectId: string,
+    @Body() dto: PrimaryDataSectionReviewDto,
+  ): Promise<any> {
+    return this.companyProjectsService.reviewPrimaryDataSectionAsAdmin(
+      projectId,
+      dto.info_type,
+      dto.status,
+      dto.remarks,
+    );
   }
 
   @Patch(':projectId/proforma-invoices/:invoiceId/approval')

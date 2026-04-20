@@ -6712,6 +6712,9 @@ export class CompanyProjectsService {
     }
     Object.assign(primary_data_rows, tarRowsCalculated);
 
+    const sectionCodes = (sections || []).map((s: any) => String(s?.info_type || '')).filter(Boolean);
+    const sectionReviews = this.buildSectionReviews(sectionCodes, validSavedRows as any[]);
+
     return {
       status: 'success',
       message: 'Primary data form retrieved',
@@ -6736,6 +6739,7 @@ export class CompanyProjectsService {
         ps_calculation_issues: psCalculationIssues,
         gin_calculation_issues: ginCalculationIssues,
         tar_calculation_issues: tarCalculationIssues,
+        section_reviews: sectionReviews,
         document_status_labels: this.getPrimaryDataDocStatusLabels(),
         sections,
       },
@@ -6747,6 +6751,54 @@ export class CompanyProjectsService {
     const { companyId, resolvedProjectId } =
       await this.resolveRegistrationIdsForAdminParam(projectIdOrCompanyId);
     return this.getPrimaryData(companyId, resolvedProjectId);
+  }
+
+  /**
+   * Section-wise primary-data review state only (same `section_reviews` shape as full GET primary-data).
+   * Param may be project Mongo _id or company _id.
+   */
+  async getPrimaryDataSectionReviewsForAdmin(projectIdOrCompanyId: string) {
+    const { companyId, resolvedProjectId } =
+      await this.resolveRegistrationIdsForAdminParam(projectIdOrCompanyId);
+    const project = await this.projectModel
+      .findOne({ _id: resolvedProjectId, company_id: companyId })
+      .lean();
+    if (!project) {
+      throw new NotFoundException({ status: 'error', message: 'Project not found' });
+    }
+    const cId = new Types.ObjectId(companyId);
+    const pId = new Types.ObjectId(resolvedProjectId);
+    const [masterList, savedRows, sections] = await Promise.all([
+      this.masterPrimaryDataChecklistModel.find({ is_active: 1 }).sort({ checklist_order: 1 }).lean(),
+      this.primaryDataFormModel.find({ company_id: cId, project_id: pId }).lean(),
+      this.getSectionsFromMaster(),
+    ]);
+    const masterMetaById = new Map<string, { info_type: string }>();
+    for (const m of masterList as any[]) {
+      const id = m?._id?.toString?.() ?? String(m?._id ?? '');
+      if (!id) continue;
+      masterMetaById.set(id, { info_type: String(m?.info_type || '') });
+    }
+    const validSavedRows = (savedRows as any[]).filter((row) => {
+      const id = row?.data_id?.toString?.() ?? String(row?.data_id ?? '');
+      if (!id) return false;
+      const meta = masterMetaById.get(id);
+      if (!meta) return false;
+      return String(row?.info_type || '') === String(meta.info_type || '');
+    });
+    const sectionCodes = (sections || []).map((s: any) => String(s?.info_type || '')).filter(Boolean);
+    const sectionReviews = this.buildSectionReviews(sectionCodes, validSavedRows as any[]);
+    return {
+      status: 'success',
+      message: 'Primary data section reviews',
+      data: {
+        project_id: resolvedProjectId,
+        company_id: companyId,
+        section_reviews: sectionReviews,
+        document_status_labels: this.getPrimaryDataDocStatusLabels(),
+        sections,
+      },
+    };
   }
 
   /**
@@ -6762,6 +6814,16 @@ export class CompanyProjectsService {
   ) {
     const requestedFormType = formType && String(formType).trim() ? String(formType).trim() : 'gi';
     const infoType = this.normalizePrimaryDataFormType(requestedFormType);
+
+    if (infoType !== 'all') {
+      const reviewState = await this.getSectionReviewState(companyId, projectId, infoType);
+      if (!reviewState.can_company_edit) {
+        throw new BadRequestException({
+          status: 'error',
+          message: `Section "${infoType}" is ${reviewState.status} and cannot be edited by company.`,
+        });
+      }
+    }
 
     // Backward-compatible "all" flow: accept payload grouped by section keys
     // or a flat object keyed by data_id/checklist identifiers across all sections.
@@ -7116,6 +7178,75 @@ export class CompanyProjectsService {
     };
     if (aliases[compact]) return aliases[compact];
     return raw;
+  }
+
+  private reviewStatusFromDocStatus(
+    status?: number,
+  ): 'pending' | 'accepted' | 'rejected' | 'under_review' {
+    if (status === PRIMARY_DATA_DOC_STATUS.ACCEPTED) return 'accepted';
+    if (status === PRIMARY_DATA_DOC_STATUS.NOT_ACCEPTED) return 'rejected';
+    if (status === PRIMARY_DATA_DOC_STATUS.UNDER_REVIEW) return 'under_review';
+    return 'pending';
+  }
+
+  private docStatusFromReviewStatus(status: string): number {
+    const normalized = String(status || '').trim().toLowerCase();
+    if (normalized === 'accepted') return PRIMARY_DATA_DOC_STATUS.ACCEPTED;
+    if (normalized === 'rejected') return PRIMARY_DATA_DOC_STATUS.NOT_ACCEPTED;
+    if (normalized === 'under_review') return PRIMARY_DATA_DOC_STATUS.UNDER_REVIEW;
+    return PRIMARY_DATA_DOC_STATUS.PENDING;
+  }
+
+  private canCompanyEditByReviewStatus(status: string): boolean {
+    const normalized = String(status || '').trim().toLowerCase();
+    return normalized === 'pending' || normalized === 'rejected';
+  }
+
+  private buildSectionReviews(sectionCodes: string[], rows: any[]): Record<string, any> {
+    const latestBySection = new Map<string, any>();
+    for (const row of rows || []) {
+      const section = String(row?.info_type || '').trim();
+      if (!section) continue;
+      const prev = latestBySection.get(section);
+      if (!prev) {
+        latestBySection.set(section, row);
+        continue;
+      }
+      const prevTs = new Date(prev?.updatedAt ?? prev?.createdAt ?? 0).getTime();
+      const curTs = new Date(row?.updatedAt ?? row?.createdAt ?? 0).getTime();
+      if (curTs >= prevTs) latestBySection.set(section, row);
+    }
+
+    const sectionReviews: Record<string, any> = {};
+    for (const section of sectionCodes || []) {
+      const latest = latestBySection.get(section);
+      const status = this.reviewStatusFromDocStatus(Number(latest?.document_status));
+      sectionReviews[section] = {
+        status,
+        remarks: latest?.document_remarks ?? null,
+        can_company_edit: this.canCompanyEditByReviewStatus(status),
+      };
+    }
+    return sectionReviews;
+  }
+
+  private async getSectionReviewState(companyId: string, projectId: string, infoTypeRaw: string): Promise<{
+    status: 'pending' | 'accepted' | 'rejected' | 'under_review';
+    remarks: string | null;
+    can_company_edit: boolean;
+  }> {
+    const infoType = this.normalizePrimaryDataFormType(infoTypeRaw);
+    const pId = new Types.ObjectId(projectId);
+    const latest = await this.primaryDataFormModel
+      .findOne({ company_id: companyId, project_id: pId, info_type: infoType })
+      .sort({ updatedAt: -1, createdAt: -1 })
+      .lean();
+    const status = this.reviewStatusFromDocStatus(Number(latest?.document_status));
+    return {
+      status,
+      remarks: (latest?.document_remarks as string) ?? null,
+      can_company_edit: this.canCompanyEditByReviewStatus(status),
+    };
   }
 
   private normalizeYesNoValue(value: unknown): string | undefined {
@@ -8575,7 +8706,20 @@ export class CompanyProjectsService {
           additional_details: sectionRow?.additional_details,
         }));
 
+    for (const item of items) {
+      item.info_type = this.normalizePrimaryDataFormType(String(item?.info_type || 'gi'));
+    }
     const infoTypes = [...new Set(items.map((x) => String(x?.info_type || 'gi')))];
+    for (const rawType of infoTypes) {
+      const sectionType = this.normalizePrimaryDataFormType(rawType);
+      const reviewState = await this.getSectionReviewState(companyId, projectId, sectionType);
+      if (!reviewState.can_company_edit) {
+        throw new BadRequestException({
+          status: 'error',
+          message: `Section "${sectionType}" is ${reviewState.status} and cannot be edited by company.`,
+        });
+      }
+    }
     const masterRows = await this.masterPrimaryDataChecklistModel
       .find({ is_active: 1, info_type: { $in: infoTypes } })
       .select('_id info_type')
@@ -8841,6 +8985,34 @@ export class CompanyProjectsService {
       message: 'Primary Data save successfully',
       data: { primary_data_approval_count: approvalCount },
     };
+  }
+
+  /**
+   * Admin review endpoint wrapper for section-wise primary-data review states.
+   */
+  async reviewPrimaryDataSectionAsAdmin(
+    projectIdOrCompanyId: string,
+    infoTypeRaw: string,
+    statusRaw: 'accepted' | 'rejected' | 'under_review',
+    remarks?: string,
+  ) {
+    const { companyId, resolvedProjectId } =
+      await this.resolveRegistrationIdsForAdminParam(projectIdOrCompanyId);
+    const infoType = this.normalizePrimaryDataFormType(infoTypeRaw);
+    const status = this.docStatusFromReviewStatus(statusRaw);
+    if (status === PRIMARY_DATA_DOC_STATUS.NOT_ACCEPTED && !String(remarks || '').trim()) {
+      throw new BadRequestException({
+        status: 'error',
+        message: 'remarks is required when status is rejected.',
+      });
+    }
+    return this.primaryDataFormApproval(
+      companyId,
+      resolvedProjectId,
+      infoType,
+      status,
+      remarks?.trim() || undefined,
+    );
   }
 
   /**
