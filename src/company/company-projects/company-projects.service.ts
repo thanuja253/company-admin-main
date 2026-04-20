@@ -6300,6 +6300,13 @@ export class CompanyProjectsService {
 
     // Merged rows: for each master row, attach saved values so Reference Unit (and FY) come from saved when present.
     // primary_data_rows is keyed by info_type (gi, ee, wc, ...) so the UI can use primary_data_rows[activeSection].
+    const displayFallback = (v: unknown) => {
+      if (v == null || v === '') return undefined;
+      if (typeof v === 'number' && v === 0) return undefined;
+      if (typeof v === 'string' && v.trim() === '0') return undefined;
+      return v;
+    };
+
     const mergedRowsFlat = (masterList as any[]).map((master) => {
       const mid = master._id?.toString?.() ?? master._id;
       const saved = mid ? latestMap.get(String(mid)) : null;
@@ -6312,14 +6319,14 @@ export class CompanyProjectsService {
         category: saved?.category ?? master.category,
         gi_category: saved?.gi_category ?? master.gi_category,
         details: saved?.details ?? master.details,
-        fy1: saved?.fy1 ?? master.fy1 ?? 0,
-        fy2: saved?.fy2 ?? master.fy2 ?? 0,
-        fy3: saved?.fy3 ?? master.fy3 ?? 0,
-        fy4: saved?.fy4 ?? master.fy4 ?? 0,
-        fy5: saved?.fy5 ?? master.fy5 ?? 0,
-        extrapolated: saved?.extrapolated ?? master.extrapolated,
-        lt_target: saved?.lt_target ?? master.lt_target,
-        additional_details: saved?.additional_details ?? master.additional_details,
+        fy1: saved?.fy1 ?? displayFallback(master.fy1),
+        fy2: saved?.fy2 ?? displayFallback(master.fy2),
+        fy3: saved?.fy3 ?? displayFallback(master.fy3),
+        fy4: saved?.fy4 ?? displayFallback(master.fy4),
+        fy5: saved?.fy5 ?? displayFallback(master.fy5),
+        extrapolated: saved?.extrapolated ?? displayFallback(master.extrapolated),
+        lt_target: saved?.lt_target ?? displayFallback(master.lt_target),
+        additional_details: saved?.additional_details ?? displayFallback(master.additional_details),
         document: saved?.document,
         document_status: saved?.document_status,
         final_submit: saved?.final_submit,
@@ -6714,6 +6721,9 @@ export class CompanyProjectsService {
         saved_by_info_type: normalizedByInfoType,
         saved_by_data_id: normalizedSavedByDataId,
         primary_data_rows,
+        // Backward-compatible aliases used by some frontend flows.
+        gge_rows: primary_data_rows.gge || [],
+        gge: primary_data_rows.gge || [],
         final_submit_docs: finalSubmitCount,
         primary_data_approval_count: approvalCount,
         ee_calculation_issues: eeCalculationIssues,
@@ -6750,13 +6760,20 @@ export class CompanyProjectsService {
     payload: any,
     finalSubmit?: boolean,
   ) {
-    const infoType = formType && String(formType).trim() ? String(formType).trim() : 'gi';
+    const requestedFormType = formType && String(formType).trim() ? String(formType).trim() : 'gi';
+    const infoType = this.normalizePrimaryDataFormType(requestedFormType);
     let masterRowsCache: any[] | null = null;
     const getMasterRows = async () => {
       if (masterRowsCache) return masterRowsCache;
       masterRowsCache = await this.masterPrimaryDataChecklistModel
         .find({ info_type: infoType, is_active: 1 })
         .lean();
+      if (!masterRowsCache.length) {
+        throw new BadRequestException({
+          status: 'error',
+          message: `Invalid primary-data form_type "${requestedFormType}". Use a valid section code (e.g. gi, ee, wc, re, gge, wm, mcr, gsc, ps, gin, tar).`,
+        });
+      }
       return masterRowsCache;
     };
 
@@ -6819,15 +6836,26 @@ export class CompanyProjectsService {
     } else if (payload && typeof payload === 'object') {
       const mongoose = require('mongoose');
       const masterRows = await getMasterRows();
+      const payloadObject =
+        payload &&
+        typeof payload === 'object' &&
+        !Array.isArray(payload) &&
+        payload.data &&
+        typeof payload.data === 'object' &&
+        !Array.isArray(payload.data)
+          ? payload.data
+          : payload;
+      let matchedRows = 0;
       for (const row of masterRows as any[]) {
         const dataId = row._id.toString();
         const checklistOrderKey = String(row?.checklist_order ?? '');
         const sectionRow =
-          payload[dataId] ??
-          (checklistOrderKey ? payload[checklistOrderKey] : undefined) ??
-          payload[row.parameter] ??
-          payload[row.checklist_name];
+          payloadObject[dataId] ??
+          (checklistOrderKey ? payloadObject[checklistOrderKey] : undefined) ??
+          payloadObject[row.parameter] ??
+          payloadObject[row.checklist_name];
         if (sectionRow == null) continue;
+        matchedRows++;
         doc.push({
           data_id: dataId,
           info_type: infoType,
@@ -6844,6 +6872,13 @@ export class CompanyProjectsService {
           extrapolated: sectionRow.extrapolated,
           lt_target: sectionRow.lt_target,
           additional_details: sectionRow.additional_details,
+        });
+      }
+      if (!matchedRows && Object.keys(payloadObject).length) {
+        throw new BadRequestException({
+          status: 'error',
+          message: `No rows matched for form_type "${infoType}". Use keys as data_id/checklist_order from GET /primary-data. ` +
+            `Received keys: ${Object.keys(payloadObject).slice(0, 5).join(', ') || '(none)'}.`,
         });
       }
     }
@@ -6901,6 +6936,27 @@ export class CompanyProjectsService {
       .replace(/[^a-z0-9]+/g, ' ')
       .replace(/\s+/g, ' ')
       .trim();
+  }
+
+  private normalizePrimaryDataFormType(formType: string): string {
+    const raw = String(formType || '').trim().toLowerCase();
+    const compact = raw.replace(/[^a-z0-9]+/g, '');
+    const aliases: Record<string, string> = {
+      greenhousegasemissions: 'gge',
+      greenhousegasesemissions: 'gge',
+      wastemanagement: 'wm',
+      materialconservationrecyclingandrecyclables: 'mcr',
+      materialconservationandrecycling: 'mcr',
+      materialconservation: 'mcr',
+      mcrr: 'mcr',
+      greensupplychain: 'gsc',
+      productstewardship: 'ps',
+      greeninfrastructure: 'gin',
+      target: 'tar',
+      targets: 'tar',
+    };
+    if (aliases[compact]) return aliases[compact];
+    return raw;
   }
 
   private findEeRow(
@@ -7206,6 +7262,8 @@ export class CompanyProjectsService {
     for (const row of existingRows as any[]) {
       const id = row?.data_id?.toString?.() ?? String(row?.data_id ?? '');
       if (!id) continue;
+      const master = byMasterDataId.get(id);
+      if (!master) continue;
       rowsByDataId.set(id, { ...row, data_id: id, info_type: 'ee' });
     }
 
@@ -7409,6 +7467,8 @@ export class CompanyProjectsService {
     for (const row of existingRows as any[]) {
       const id = row?.data_id?.toString?.() ?? String(row?.data_id ?? '');
       if (!id) continue;
+      const master = byMasterDataId.get(id);
+      if (!master) continue;
       rowsByDataId.set(id, { ...row, data_id: id, info_type: 'wc' });
     }
 
@@ -7515,6 +7575,7 @@ export class CompanyProjectsService {
       const id = row?.data_id?.toString?.() ?? String(row?.data_id ?? '');
       if (!id) continue;
       const master = byMasterDataId.get(id);
+      if (!master) continue;
       rowsByDataId.set(id, {
         ...row,
         data_id: id,
@@ -7627,6 +7688,7 @@ export class CompanyProjectsService {
       const id = row?.data_id?.toString?.() ?? String(row?.data_id ?? '');
       if (!id) continue;
       const master = byMasterDataId.get(id);
+      if (!master) continue;
       rowsByDataId.set(id, {
         ...row,
         data_id: id,
@@ -7743,6 +7805,7 @@ export class CompanyProjectsService {
       const id = row?.data_id?.toString?.() ?? String(row?.data_id ?? '');
       if (!id) continue;
       const master = byMasterDataId.get(id);
+      if (!master) continue;
       rowsByDataId.set(id, {
         ...row,
         data_id: id,
@@ -7852,6 +7915,7 @@ export class CompanyProjectsService {
       const id = row?.data_id?.toString?.() ?? String(row?.data_id ?? '');
       if (!id) continue;
       const master = byMasterDataId.get(id);
+      if (!master) continue;
       rowsByDataId.set(id, {
         ...row,
         data_id: id,
@@ -7942,6 +8006,7 @@ export class CompanyProjectsService {
       const id = row?.data_id?.toString?.() ?? String(row?.data_id ?? '');
       if (!id) continue;
       const master = byMasterDataId.get(id);
+      if (!master) continue;
       rowsByDataId.set(id, {
         ...row,
         data_id: id,
@@ -8032,6 +8097,7 @@ export class CompanyProjectsService {
       const id = row?.data_id?.toString?.() ?? String(row?.data_id ?? '');
       if (!id) continue;
       const master = byMasterDataId.get(id);
+      if (!master) continue;
       rowsByDataId.set(id, {
         ...row,
         data_id: id,
@@ -8122,6 +8188,7 @@ export class CompanyProjectsService {
       const id = row?.data_id?.toString?.() ?? String(row?.data_id ?? '');
       if (!id) continue;
       const master = byMasterDataId.get(id);
+      if (!master) continue;
       rowsByDataId.set(id, {
         ...row,
         data_id: id,
@@ -8212,6 +8279,7 @@ export class CompanyProjectsService {
       const id = row?.data_id?.toString?.() ?? String(row?.data_id ?? '');
       if (!id) continue;
       const master = byMasterDataId.get(id);
+      if (!master) continue;
       rowsByDataId.set(id, {
         ...row,
         data_id: id,
