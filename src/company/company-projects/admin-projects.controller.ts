@@ -59,12 +59,22 @@ export class AdminProjectsController {
   }
 
   /**
+   * Registration payload + masters (same as GET .../admin/registration-data on company routes).
+   * GET /api/admin/projects/:projectId/registration-date
+   * Alias for dashboards that expect this path; no admin JWT (portal callers).
+   */
+  @Get(':projectId/registration-date')
+  async getRegistrationDateAlias(@Param('projectId') projectId: string): Promise<any> {
+    return this.companyProjectsService.getRegistrationInfoForAdmin(projectId);
+  }
+
+  /**
    * Admin: Primary Data (same payload as company endpoint).
    * GET /api/admin/projects/:projectId/primary-data
    * Legacy: GET /admin/projects/:projectId/primary-data
+   * No admin JWT guard (portal callers use this path).
    */
   @Get(':projectId/primary-data')
-  @UseGuards(AdminJwtAuthGuard)
   async getPrimaryDataForAdmin(@Param('projectId') projectId: string): Promise<any> {
     return this.companyProjectsService.getPrimaryDataForAdmin(projectId);
   }

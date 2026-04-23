@@ -1361,6 +1361,15 @@ export class CompanyProjectsController {
   }
 
   /**
+   * Frontend alias: same JSON as proposal-workorder-documents (refresh hint in path only).
+   * GET /api/company/projects/:projectId/proposal-work-order-documents/refresh
+   */
+  @Get(':projectId/proposal-work-order-documents/refresh')
+  async getProposalWorkOrderDocumentsRefresh(@Param('projectId') projectId: string): Promise<any> {
+    return this.companyProjectsService.getProposalWorkOrderDocumentsForAdmin(projectId);
+  }
+
+  /**
    * Get Proposal/Work Order Documents (combined endpoint)
    * GET /api/company/projects/:projectId/proposal-workorder-documents
    *
@@ -1688,6 +1697,23 @@ export class CompanyProjectsController {
   @Get(':projectId/assignments')
   async getAssignmentsAlias(@Param('projectId') projectId: string): Promise<any> {
     return this.companyProjectsService.getAssignmentDetailsForAdmin(projectId);
+  }
+
+  /**
+   * Primary Data: per-tab review state + which tabs allow company re-upload (`editable_section_codes_for_reupload`).
+   * GET /api/company/projects/:projectId/primary-data/review
+   * With company JWT: `projectId` must be the project _id for that company. Without JWT: admin-style id resolve.
+   */
+  @Get(':projectId/primary-data/review')
+  async getPrimaryDataSectionReviews(
+    @Request() req,
+    @Param('projectId') projectId: string,
+  ): Promise<any> {
+    const companyId = req?.user?.userId;
+    if (companyId) {
+      return this.companyProjectsService.getPrimaryDataSectionReviewsForCompany(companyId, projectId);
+    }
+    return this.companyProjectsService.getPrimaryDataSectionReviewsForAdmin(projectId);
   }
 
   /**
@@ -2599,36 +2625,47 @@ export class CompanyProjectsController {
   }
 
   /**
+   * PO acceptance / WO status form slice (same as admin work-order-po read).
+   * GET /api/company/projects/:projectId/work-order-document/acceptance
+   */
+  @Get(':projectId/work-order-document/acceptance')
+  async getWorkOrderDocumentAcceptance(@Param('projectId') projectId: string): Promise<any> {
+    return this.companyProjectsService.getWorkOrderPoAdminFormForAdmin(projectId);
+  }
+
+  /**
    * Work order review remarks/status only (no document URL). Placed before work-order-document so
    * GET .../work-order-document/remarks is not swallowed by the shorter route.
    * GET /api/company/projects/:projectId/work-order-document/remarks
+   * Open when no company JWT: resolve id like admin quickview (portal / dashboard).
    */
   @Get(':projectId/work-order-document/remarks')
-  @UseGuards(JwtAuthGuard, AccountStatusGuard)
   async getWorkOrderDocumentRemarks(
     @Request() req,
     @Param('projectId') projectId: string,
   ): Promise<any> {
-    return this.companyProjectsService.getWorkOrderDocumentRemarks(
-      req.user.userId,
-      projectId,
-    );
+    const companyId = req?.user?.userId;
+    if (companyId) {
+      return this.companyProjectsService.getWorkOrderDocumentRemarks(companyId, projectId);
+    }
+    return this.companyProjectsService.getWorkOrderDocumentRemarksForAdminParam(projectId);
   }
 
   /**
    * Get latest Work Order document metadata.
    * GET /api/company/projects/:projectId/work-order-document
+   * Open when no company JWT: resolve id like admin quickview.
    */
   @Get(':projectId/work-order-document')
-  @UseGuards(JwtAuthGuard, AccountStatusGuard)
   async getWorkOrderDocument(
     @Request() req,
     @Param('projectId') projectId: string,
   ): Promise<any> {
-    return this.companyProjectsService.getWorkOrderDocument(
-      req.user.userId,
-      projectId,
-    );
+    const companyId = req?.user?.userId;
+    if (companyId) {
+      return this.companyProjectsService.getWorkOrderDocument(companyId, projectId);
+    }
+    return this.companyProjectsService.getWorkOrderDocumentForAdminParam(projectId);
   }
 
   /**

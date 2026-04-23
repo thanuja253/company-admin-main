@@ -356,7 +356,7 @@ export class RegistrationMastersService {
       console.log('[RegistrationMasters] Results:', {
         industries: industries.length,
         entities: entities.length,
-        sectors: sectors.length,
+        sectors: 0,
         states: states.length,
         facilitators: facilitators.length,
       });
@@ -370,11 +370,7 @@ export class RegistrationMastersService {
           id: e._id.toString(),
           name: e.name,
         })),
-        sectors: sectors.map((s: any) => ({
-          id: s._id.toString(),
-          name: s.name,
-          group_name: s.group_name || '',
-        })),
+        sectors: [],
         states: states.map((s: any) => ({
           id: s._id.toString(),
           name: s.name,

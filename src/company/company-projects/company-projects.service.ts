@@ -2276,13 +2276,44 @@ export class CompanyProjectsService {
       nextStepDisplayName = 'Company will Re pay 1st Performa Invoice';
       nextStepDisplayResponsibility = 'Company';
     } else if (proformaApprovalStatus === 1 && proformaPaymentStatus === 1) {
-      // Once proforma is paid and acknowledged, Quick View should move to Primary Data
-      // even when legacy next_activities_id was not advanced.
+      // Once proforma is paid and acknowledged, Quick View moves to Primary Data — unless
+      // the company has already submitted primary data (`final_submit` / next_activities_id ≥ 12),
+      // in which case latest/next reflect CII review (step 12) or assessment phase (step 13).
+      const nextActRaw = Number((project as any).next_activities_id || 0);
+      const primaryDataSubmitted =
+        nextActRaw >= 12 ||
+        !!(await this.primaryDataFormModel
+          .findOne({
+            company_id: companyOidForWo,
+            project_id: projectOidForWo,
+            final_submit: 1,
+          })
+          .select('_id')
+          .lean());
+
       effectiveNextId = Math.max(effectiveNextId, 11);
-      latestStepDisplayName = 'CII will Acknowlement Proforma Invoice';
-      latestStepDisplayResponsibility = 'CII';
-      nextStepDisplayName = 'Need to Upload Primary Data Form';
-      nextStepDisplayResponsibility = 'Company';
+
+      if (primaryDataSubmitted) {
+        const allPdAccepted = await this.areAllSubmittedPrimaryDataSectionsAccepted(companyId, projectId);
+        if (allPdAccepted) {
+          effectiveNextId = Math.max(effectiveNextId, 13);
+          latestStepDisplayName = milestoneSteps[12].name;
+          latestStepDisplayResponsibility = milestoneSteps[12].responsibility;
+          nextStepDisplayName = 'Need to Upload Primary Data Form';
+          nextStepDisplayResponsibility = 'Company';
+        } else {
+          effectiveNextId = Math.max(effectiveNextId, 12);
+          latestStepDisplayName = 'Company submitted Primary Data Form';
+          latestStepDisplayResponsibility = 'Company';
+          nextStepDisplayName = 'CII to review and approve Primary Data Form';
+          nextStepDisplayResponsibility = 'CII';
+        }
+      } else {
+        latestStepDisplayName = 'CII will Acknowlement Proforma Invoice';
+        latestStepDisplayResponsibility = 'CII';
+        nextStepDisplayName = 'Need to Upload Primary Data Form';
+        nextStepDisplayResponsibility = 'Company';
+      }
     } else if (hasProformaInvoiceDocument && proformaPaymentStatus === 1 && proformaApprovalStatus === 0) {
       latestStepDisplayName = 'Company Paid Proforma Invoice';
       latestStepDisplayResponsibility = 'Company';
@@ -5450,6 +5481,20 @@ export class CompanyProjectsService {
     };
   }
 
+  /** Open / portal read: resolve project or company id then {@link getWorkOrderDocument}. */
+  async getWorkOrderDocumentForAdminParam(projectIdOrCompanyId: string) {
+    const { companyId, resolvedProjectId } =
+      await this.resolveRegistrationIdsForAdminParam(projectIdOrCompanyId);
+    return this.getWorkOrderDocument(companyId, resolvedProjectId);
+  }
+
+  /** Open / portal read: resolve project or company id then {@link getWorkOrderDocumentRemarks}. */
+  async getWorkOrderDocumentRemarksForAdminParam(projectIdOrCompanyId: string) {
+    const { companyId, resolvedProjectId } =
+      await this.resolveRegistrationIdsForAdminParam(projectIdOrCompanyId);
+    return this.getWorkOrderDocumentRemarks(companyId, resolvedProjectId);
+  }
+
   /**
    * Legacy single-file upload: same as {@link addLaunchTrainingSession} (field `launch_upload`).
    * Accepts optional `session_index` (1–4) and date via `session_date` or `launch_training_report_date`.
@@ -6714,6 +6759,9 @@ export class CompanyProjectsService {
 
     const sectionCodes = (sections || []).map((s: any) => String(s?.info_type || '')).filter(Boolean);
     const sectionReviews = this.buildSectionReviews(sectionCodes, validSavedRows as any[]);
+    const { editable: editableSectionCodesForReupload, locked: lockedSectionCodesForReupload } =
+      this.splitEditableSectionCodes(sectionCodes, sectionReviews);
+    const sectionResubmittedAtMap = this.buildSectionResubmittedAtMap(sectionCodes, sectionReviews);
 
     return {
       status: 'success',
@@ -6740,6 +6788,12 @@ export class CompanyProjectsService {
         gin_calculation_issues: ginCalculationIssues,
         tar_calculation_issues: tarCalculationIssues,
         section_reviews: sectionReviews,
+        /** Per tab: ISO time of last company save after admin rejection (`company_resubmitted_at`); null if none. */
+        section_resubmitted_at: sectionResubmittedAtMap,
+        /** Tabs where `can_company_edit` is true — only these may save / show “Update” for that section. */
+        editable_section_codes_for_reupload: editableSectionCodesForReupload,
+        /** Tabs where review status blocks company edits (accepted / under_review). */
+        locked_section_codes_for_reupload: lockedSectionCodesForReupload,
         document_status_labels: this.getPrimaryDataDocStatusLabels(),
         sections,
       },
@@ -6751,6 +6805,17 @@ export class CompanyProjectsService {
     const { companyId, resolvedProjectId } =
       await this.resolveRegistrationIdsForAdminParam(projectIdOrCompanyId);
     return this.getPrimaryData(companyId, resolvedProjectId);
+  }
+
+  /**
+   * Company session: project must belong to `companyId`. Uses project `_id` in the URL (not company id).
+   */
+  async getPrimaryDataSectionReviewsForCompany(companyId: string, projectId: string) {
+    const project = await this.projectModel.findOne({ _id: projectId, company_id: companyId }).lean();
+    if (!project) {
+      throw new NotFoundException({ status: 'error', message: 'Project not found' });
+    }
+    return this.buildPrimaryDataSectionReviewsPayload(companyId, projectId);
   }
 
   /**
@@ -6766,6 +6831,36 @@ export class CompanyProjectsService {
     if (!project) {
       throw new NotFoundException({ status: 'error', message: 'Project not found' });
     }
+    return this.buildPrimaryDataSectionReviewsPayload(companyId, resolvedProjectId);
+  }
+
+  private splitEditableSectionCodes(
+    sectionCodes: string[],
+    sectionReviews: Record<string, any>,
+  ): { editable: string[]; locked: string[] } {
+    const editable: string[] = [];
+    const locked: string[] = [];
+    for (const code of sectionCodes) {
+      if (sectionReviews[code]?.can_company_edit === true) editable.push(code);
+      else locked.push(code);
+    }
+    return { editable, locked };
+  }
+
+  /** Flat map of `info_type` → ISO timestamp or null (same as `section_reviews[*].company_resubmitted_at`). */
+  private buildSectionResubmittedAtMap(
+    sectionCodes: string[],
+    sectionReviews: Record<string, any>,
+  ): Record<string, string | null> {
+    const out: Record<string, string | null> = {};
+    for (const code of sectionCodes) {
+      const v = sectionReviews[code]?.company_resubmitted_at;
+      out[code] = v != null ? String(v) : null;
+    }
+    return out;
+  }
+
+  private async buildPrimaryDataSectionReviewsPayload(companyId: string, resolvedProjectId: string) {
     const cId = new Types.ObjectId(companyId);
     const pId = new Types.ObjectId(resolvedProjectId);
     const [masterList, savedRows, sections] = await Promise.all([
@@ -6788,6 +6883,9 @@ export class CompanyProjectsService {
     });
     const sectionCodes = (sections || []).map((s: any) => String(s?.info_type || '')).filter(Boolean);
     const sectionReviews = this.buildSectionReviews(sectionCodes, validSavedRows as any[]);
+    const { editable: editableSectionCodesForReupload, locked: lockedSectionCodesForReupload } =
+      this.splitEditableSectionCodes(sectionCodes, sectionReviews);
+    const sectionResubmittedAtMap = this.buildSectionResubmittedAtMap(sectionCodes, sectionReviews);
     return {
       status: 'success',
       message: 'Primary data section reviews',
@@ -6795,6 +6893,9 @@ export class CompanyProjectsService {
         project_id: resolvedProjectId,
         company_id: companyId,
         section_reviews: sectionReviews,
+        section_resubmitted_at: sectionResubmittedAtMap,
+        editable_section_codes_for_reupload: editableSectionCodesForReupload,
+        locked_section_codes_for_reupload: lockedSectionCodesForReupload,
         document_status_labels: this.getPrimaryDataDocStatusLabels(),
         sections,
       },
@@ -7204,9 +7305,18 @@ export class CompanyProjectsService {
 
   private buildSectionReviews(sectionCodes: string[], rows: any[]): Record<string, any> {
     const latestBySection = new Map<string, any>();
+    const maxResubmittedMsBySection = new Map<string, number>();
     for (const row of rows || []) {
       const section = String(row?.info_type || '').trim();
       if (!section) continue;
+      const rs = (row as any)?.company_resubmitted_at;
+      if (rs != null) {
+        const t = new Date(rs).getTime();
+        if (!Number.isNaN(t)) {
+          const prev = maxResubmittedMsBySection.get(section) ?? 0;
+          if (t > prev) maxResubmittedMsBySection.set(section, t);
+        }
+      }
       const prev = latestBySection.get(section);
       if (!prev) {
         latestBySection.set(section, row);
@@ -7221,10 +7331,17 @@ export class CompanyProjectsService {
     for (const section of sectionCodes || []) {
       const latest = latestBySection.get(section);
       const status = this.reviewStatusFromDocStatus(Number(latest?.document_status));
+      const maxMs = maxResubmittedMsBySection.get(section);
+      const company_resubmitted_at =
+        maxMs != null && maxMs > 0 ? new Date(maxMs).toISOString() : null;
       sectionReviews[section] = {
         status,
         remarks: latest?.document_remarks ?? null,
         can_company_edit: this.canCompanyEditByReviewStatus(status),
+        /** ISO 8601 — latest save by company after admin rejected this section; null if never. */
+        company_resubmitted_at,
+        /** true if {@link company_resubmitted_at} is set (at least one post-rejection save recorded). */
+        resubmitted_after_rejection: company_resubmitted_at != null,
       };
     }
     return sectionReviews;
@@ -8710,9 +8827,18 @@ export class CompanyProjectsService {
       item.info_type = this.normalizePrimaryDataFormType(String(item?.info_type || 'gi'));
     }
     const infoTypes = [...new Set(items.map((x) => String(x?.info_type || 'gi')))];
+    const reviewStateBySection = new Map<
+      string,
+      {
+        status: 'pending' | 'accepted' | 'rejected' | 'under_review';
+        remarks: string | null;
+        can_company_edit: boolean;
+      }
+    >();
     for (const rawType of infoTypes) {
       const sectionType = this.normalizePrimaryDataFormType(rawType);
       const reviewState = await this.getSectionReviewState(companyId, projectId, sectionType);
+      reviewStateBySection.set(sectionType, reviewState);
       if (!reviewState.can_company_edit) {
         throw new BadRequestException({
           status: 'error',
@@ -8765,6 +8891,10 @@ export class CompanyProjectsService {
         lt_target: toNum(item.lt_target),
         additional_details: item.additional_details,
       };
+      const priorReview = reviewStateBySection.get(infoType);
+      if (priorReview?.status === 'rejected') {
+        update.company_resubmitted_at = new Date();
+      }
 
       await this.primaryDataFormModel.updateOne(
         { company_id: cId, project_id: pId, info_type: update.info_type, data_id: dataId },
@@ -8777,7 +8907,36 @@ export class CompanyProjectsService {
   }
 
   /**
-   * Submit Primary Data: set final_submit = 1 for all project rows, advance next_activities_id to 11 (Company Uploaded All Primary Data), then activity + notifications.
+   * True when every master section that has saved primary-data rows is fully accepted (CII review done for that section).
+   */
+  private async areAllSubmittedPrimaryDataSectionsAccepted(
+    companyId: string,
+    projectId: string,
+  ): Promise<boolean> {
+    const sections = await this.getSectionsFromMaster();
+    const codes = sections.map((s) => String(s.info_type || '')).filter(Boolean);
+    const pId = new Types.ObjectId(projectId);
+    const cId = new Types.ObjectId(companyId);
+    const rows = await this.primaryDataFormModel
+      .find({ company_id: cId, project_id: pId, final_submit: 1 })
+      .lean();
+    if (!rows.length) return false;
+    const codesWithData = codes.filter((code) =>
+      (rows as any[]).some((r: any) => String(r.info_type) === code),
+    );
+    if (!codesWithData.length) return false;
+    for (const code of codesWithData) {
+      const row = (rows as any[]).find((r: any) => String(r.info_type) === code);
+      if (!row || Number(row.document_status) !== PRIMARY_DATA_DOC_STATUS.ACCEPTED) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  /**
+   * Submit Primary Data: set final_submit = 1, set all rows to Under Review (company locked until CII accepts/rejects per tab),
+   * advance next_activities_id to 12 (CII to review primary data — milestone 12), activity + notifications.
    */
   async submitPrimaryData(companyId: string, projectId: string, doc: any[]) {
     await this.storePrimaryData(companyId, projectId, doc);
@@ -8786,14 +8945,20 @@ export class CompanyProjectsService {
     const pId = new mongoose.Types.ObjectId(projectId);
     await this.primaryDataFormModel.updateMany(
       { company_id: companyId, project_id: pId },
-      { $set: { final_submit: 1 } },
+      {
+        $set: {
+          final_submit: 1,
+          document_status: PRIMARY_DATA_DOC_STATUS.UNDER_REVIEW,
+        },
+      },
     );
 
     const project = await this.projectModel.findOne({ _id: projectId, company_id: companyId });
     if (project) {
-      const currentNext = (project as any).next_activities_id ?? 0;
-      if (currentNext < 11) {
-        (project as any).next_activities_id = 11; // Company Uploaded All Primary Data
+      const cur = Number((project as any).next_activities_id ?? 0);
+      // After last tab / full submit, workflow waits on CII (milestone 12 — "CII Approved All Primary Data").
+      if (cur <= 12) {
+        (project as any).next_activities_id = 12;
         await project.save();
       }
     }
@@ -8801,7 +8966,7 @@ export class CompanyProjectsService {
     await this.companyActivityModel.create({
       company_id: companyId,
       project_id: projectId,
-      description: 'Company has submitted the Primary Form Data',
+      description: 'Company has submitted the Primary Form Data — awaiting CII review (accept/reject per section)',
       activity_type: 'company',
       milestone_flow: 11,
       milestone_completed: true,
@@ -8965,25 +9130,38 @@ export class CompanyProjectsService {
     const updated = await this.primaryDataFormModel
       .find({ company_id: companyId, project_id: pId })
       .lean();
-    const approvalCount = (updated as any[]).filter((r) => r.document_status === PRIMARY_DATA_DOC_STATUS.ACCEPTED).length;
+    const approvalCount = (updated as any[]).filter(
+      (r) => r.document_status === PRIMARY_DATA_DOC_STATUS.ACCEPTED,
+    ).length;
 
-    if (approvalCount >= 110) {
+    const allSectionsAccepted = await this.areAllSubmittedPrimaryDataSectionsAccepted(companyId, projectId);
+    if (allSectionsAccepted) {
       await this.companyActivityModel.create({
         company_id: companyId,
         project_id: projectId,
-        description: 'Greenco Team has accepted/not accepted the Primary Data Form Document',
+        description: 'CII has accepted all Primary Data sections — company may proceed to assessment documents',
         activity_type: 'cii',
-        milestone_flow: 10,
+        milestone_flow: 12,
         milestone_completed: true,
       });
-      (project as any).next_activities_id = 11; // Next: All Assessment Submittals to be uploaded
-      await project.save();
+      const projectFresh = await this.projectModel.findOne({ _id: projectId, company_id: companyId });
+      if (projectFresh) {
+        const cur = Number((projectFresh as any).next_activities_id ?? 0);
+        // Milestone 13: All Checklist / Assessment Documents Uploaded by Company
+        if (cur <= 13) {
+          (projectFresh as any).next_activities_id = 13;
+          await projectFresh.save();
+        }
+      }
     }
 
     return {
       status: 'success',
       message: 'Primary Data save successfully',
-      data: { primary_data_approval_count: approvalCount },
+      data: {
+        primary_data_approval_count: approvalCount,
+        all_primary_data_sections_accepted: allSectionsAccepted,
+      },
     };
   }
 

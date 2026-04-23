@@ -74,6 +74,10 @@ export class PrimaryDataForm {
   @Prop()
   document_remarks?: string;
 
+  /** Set when company saves this row after admin had rejected the section (resubmit / re-upload). */
+  @Prop({ type: Date })
+  company_resubmitted_at?: Date;
+
   @Prop({ default: 0 })
   final_submit?: number; // 0 or 1
 

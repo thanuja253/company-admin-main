@@ -1,4 +1,4 @@
-import { Body, Controller, Param, Post, Request, UseGuards } from '@nestjs/common';
+import { Body, Controller, Get, Param, Post, Request, UseGuards } from '@nestjs/common';
 import { AccountStatusGuard } from '../company-auth/guards/account-status.guard';
 import { JwtAuthGuard } from '../company-auth/guards/jwt-auth.guard';
 import { CompanyProjectsService } from './company-projects.service';
@@ -7,9 +7,30 @@ import { CompanyProjectsService } from './company-projects.service';
  * Legacy compatibility routes used by existing frontend clients.
  * Mirrors /api/company/projects/:projectId/primary-data/save behavior.
  */
-@Controller(['company/primary-data', 'company/primary_data'])
+@Controller([
+  'api/company/primary-data',
+  'api/company/primary_data',
+  'company/primary-data',
+  'company/primary_data',
+])
 export class CompanyPrimaryDataLegacyController {
   constructor(private readonly companyProjectsService: CompanyProjectsService) {}
+
+  /**
+   * GET /api/company/primary-data/:projectId — same behavior as GET .../api/company/projects/:id/primary-data
+   * (company JWT or open admin-style resolve).
+   */
+  @Get(':projectId')
+  async getPrimaryDataLegacy(
+    @Request() req,
+    @Param('projectId') projectId: string,
+  ): Promise<any> {
+    const companyId = req?.user?.userId;
+    if (companyId) {
+      return this.companyProjectsService.getPrimaryData(companyId, projectId);
+    }
+    return this.companyProjectsService.getPrimaryDataForAdmin(projectId);
+  }
 
   @Post('save/:projectId')
   @UseGuards(JwtAuthGuard, AccountStatusGuard)
