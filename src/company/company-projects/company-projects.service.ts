@@ -2299,8 +2299,8 @@ export class CompanyProjectsService {
           effectiveNextId = Math.max(effectiveNextId, 13);
           latestStepDisplayName = milestoneSteps[12].name;
           latestStepDisplayResponsibility = milestoneSteps[12].responsibility;
-          nextStepDisplayName = 'Need to Upload Primary Data Form';
-          nextStepDisplayResponsibility = 'Company';
+          nextStepDisplayName = milestoneSteps[13].name;
+          nextStepDisplayResponsibility = milestoneSteps[13].responsibility;
         } else {
           effectiveNextId = Math.max(effectiveNextId, 12);
           latestStepDisplayName = 'Company submitted Primary Data Form';
@@ -2324,6 +2324,41 @@ export class CompanyProjectsService {
       latestStepDisplayResponsibility = 'CII';
       nextStepDisplayName = 'Company Paid Proforma Invoice';
       nextStepDisplayResponsibility = 'Company';
+    }
+
+    // Primary Data workflow override: once company final-submits primary data,
+    // Quickview should show CII review as next step until all sections are accepted.
+    // This must win even if other branches earlier set nextStepDisplayName.
+    const pdNextActRaw = Number((project as any).next_activities_id || 0);
+    const pdSubmittedFromActivities = (allActivities as any[]).some((a: any) => {
+      if (!a?.milestone_completed) return false;
+      const mf = Number(a?.milestone_flow);
+      if (mf === 11) return true;
+      const d = String(a?.description || '').toLowerCase();
+      return (d.includes('primary data') || d.includes('primary form')) && d.includes('submit');
+    });
+    const pdSubmitted =
+      pdNextActRaw >= 12 ||
+      pdSubmittedFromActivities ||
+      !!(await this.primaryDataFormModel
+        .findOne({
+          company_id: companyOidForWo,
+          project_id: projectOidForWo,
+          final_submit: 1,
+        })
+        .select('_id')
+        .lean());
+    if (pdSubmitted) {
+      const allPdAccepted = await this.areAllSubmittedPrimaryDataSectionsAccepted(companyId, projectId);
+      if (!allPdAccepted) {
+        effectiveNextId = Math.max(effectiveNextId, 12);
+        latestStepDisplayName = 'Company submitted Primary Data Form';
+        latestStepDisplayResponsibility = 'Company';
+        nextStepDisplayName = 'CII will Accept or Reject Primary Data Form';
+        nextStepDisplayResponsibility = 'CII';
+      } else {
+        effectiveNextId = Math.max(effectiveNextId, 13);
+      }
     }
 
     const projectCodePresent = !!String((project as any).project_id || '').trim();
@@ -8957,10 +8992,8 @@ export class CompanyProjectsService {
     if (project) {
       const cur = Number((project as any).next_activities_id ?? 0);
       // After last tab / full submit, workflow waits on CII (milestone 12 — "CII Approved All Primary Data").
-      if (cur <= 12) {
-        (project as any).next_activities_id = 12;
-        await project.save();
-      }
+      (project as any).next_activities_id = Math.max(cur, 12);
+      await project.save();
     }
 
     await this.companyActivityModel.create({
