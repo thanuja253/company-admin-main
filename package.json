@@ -33,7 +33,7 @@
     "passport": "^0.7.0",
     "passport-jwt": "^4.0.1",
     "reflect-metadata": "^0.1.13",
-    "resend": "^6.10.0",
+    "resend": "^6.12.2",
     "rxjs": "^7.8.1",
     "swagger-ui-express": "^5.0.1"
   },
