@@ -97,7 +97,7 @@ When you upload a proposal document:
 
 ## Local company / admin UI + Nest API (ports 3001 vs 3002)
 
-The Nest app listens on **`PORT`** (default **3019** in `src/main.ts`, unless you set `PORT=3001`).
+The Nest app listens on **`PORT`** (default **3020** in `src/main.ts`, unless you set `PORT=3001`).
 
 If the browser shows **`http://localhost:3002/...`** but API calls go to **`http://localhost:3002/api/...`**, those requests hit the **Next.js server on 3002**, not Nest, unless you add a **rewrite/proxy** to Nest.
 
@@ -106,7 +106,7 @@ If the browser shows **`http://localhost:3002/...`** but API calls go to **`http
 ```js
 // next.config.js — rewrites (example)
 async rewrites() {
-  const api = process.env.NEST_API_URL || 'http://localhost:3019';
+  const api = process.env.NEST_API_URL || 'http://localhost:3020';
   return [{ source: '/api/:path*', destination: `${api}/api/:path*` }];
 }
 ```

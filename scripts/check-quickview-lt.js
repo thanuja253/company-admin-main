@@ -5,13 +5,13 @@
  * Usage:
  *   API_URL=http://localhost:3001 ADMIN_JWT=eyJhbG... node scripts/check-quickview-lt.js 69da0e9dbb9acd3c0de61ed8
  *
- * Defaults: API_URL=http://localhost:3019, project id from first arg or env PROJECT_ID
+ * Defaults: API_URL=http://localhost:3020, project id from first arg or env PROJECT_ID
  */
 const https = require('https');
 const http = require('http');
 
 const projectId = process.argv[2] || process.env.PROJECT_ID;
-const base = (process.env.API_URL || 'http://localhost:3019').replace(/\/$/, '');
+const base = (process.env.API_URL || 'http://localhost:3020').replace(/\/$/, '');
 const adminJwt = process.env.ADMIN_JWT;
 
 if (!projectId) {

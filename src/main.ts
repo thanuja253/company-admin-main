@@ -34,7 +34,7 @@ async function bootstrap() {
     'http://localhost:3001',
     'http://localhost:3002',
     'http://localhost:3015',
-    'http://localhost:3019',
+    'http://localhost:3020',
     'http://127.0.0.1:3000',
     'http://127.0.0.1:3001',
     'http://127.0.0.1:3002',
@@ -145,7 +145,7 @@ async function bootstrap() {
   server.timeout = 30000;
   server.keepAliveTimeout = 30000;
 
-  const port = process.env.PORT || 3019;
+  const port = process.env.PORT || 3020;
   await app.listen(port, '0.0.0.0');
   console.log(
     `[API] Listening on http://localhost:${port} | CORS: ${isProduction ? 'allowlist' : 'any Origin (dev)'}`,
