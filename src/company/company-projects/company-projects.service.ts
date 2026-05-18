@@ -3079,11 +3079,12 @@ export class CompanyProjectsService {
   }
 
   /**
-   * Get proposal document info (by project id only; no company scoping — endpoint is public).
+   * Get proposal document info
    */
-  async getProposalDocument(projectId: string) {
+  async getProposalDocument(companyId: string, projectId: string) {
     const project = await this.projectModel.findOne({
       _id: projectId,
+      company_id: companyId,
     });
 
     if (!project) {

@@ -1214,11 +1214,17 @@ export class CompanyProjectsController {
   /**
    * Get Proposal Document
    * GET /api/company/projects/:projectId/proposal-document
-   * Public (no JWT): used by embedded viewers / share links.
    */
   @Get(':projectId/proposal-document')
-  async getProposalDocument(@Param('projectId') projectId: string): Promise<any> {
-    return this.companyProjectsService.getProposalDocument(projectId);
+  @UseGuards(JwtAuthGuard, AccountStatusGuard)
+  async getProposalDocument(
+    @Request() req,
+    @Param('projectId') projectId: string,
+  ): Promise<any> {
+    return this.companyProjectsService.getProposalDocument(
+      req.user.userId,
+      projectId,
+    );
   }
 
   /**
