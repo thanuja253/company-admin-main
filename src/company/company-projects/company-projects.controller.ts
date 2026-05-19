@@ -1214,17 +1214,12 @@ export class CompanyProjectsController {
   /**
    * Get Proposal Document
    * GET /api/company/projects/:projectId/proposal-document
+   *
+   * Open route (no JWT): `:projectId` may be project _id or company _id (same as proposal-workorder-documents).
    */
   @Get(':projectId/proposal-document')
-  @UseGuards(JwtAuthGuard, AccountStatusGuard)
-  async getProposalDocument(
-    @Request() req,
-    @Param('projectId') projectId: string,
-  ): Promise<any> {
-    return this.companyProjectsService.getProposalDocument(
-      req.user.userId,
-      projectId,
-    );
+  async getProposalDocument(@Param('projectId') projectId: string): Promise<any> {
+    return this.companyProjectsService.getProposalDocumentForAdmin(projectId);
   }
 
   /**

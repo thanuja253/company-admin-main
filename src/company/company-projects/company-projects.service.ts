@@ -3079,12 +3079,26 @@ export class CompanyProjectsService {
   }
 
   /**
+   * Same payload as {@link getProposalDocument}; `:projectId` may be project _id or company _id.
+   */
+  async getProposalDocumentForAdmin(projectIdOrCompanyId: string) {
+    const { companyId, resolvedProjectId } =
+      await this.resolveRegistrationIdsForAdminParam(projectIdOrCompanyId);
+    return this.getProposalDocument(companyId, resolvedProjectId);
+  }
+
+  /**
    * Get proposal document info
    */
   async getProposalDocument(companyId: string, projectId: string) {
+    if (!Types.ObjectId.isValid(companyId) || !Types.ObjectId.isValid(projectId)) {
+      throw new BadRequestException({ status: 'error', message: 'Invalid company or project id' });
+    }
+    const projectOid = new Types.ObjectId(projectId);
+    const companyOid = new Types.ObjectId(companyId);
     const project = await this.projectModel.findOne({
-      _id: projectId,
-      company_id: companyId,
+      _id: projectOid,
+      $or: [{ company_id: companyId }, { company_id: companyOid }],
     });
 
     if (!project) {
