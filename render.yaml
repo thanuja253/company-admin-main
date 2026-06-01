@@ -1,0 +1,15 @@
+# Render Blueprint — use Dashboard → Blueprint if syncing from repo,
+# or copy build/start commands into an existing Web Service.
+services:
+  - type: web
+    name: company-admin-main
+    runtime: node
+    plan: free
+    buildCommand: npm install && npm run build
+    startCommand: npm run start:prod
+    envVars:
+      - key: NODE_ENV
+        value: production
+      # Set in Render Dashboard (do not commit secrets):
+      # MONGODB_URI, RESEND_API_KEY, MAIL_FROM_ADDRESS, MAIL_PROVIDER,
+      # API_BASE_URL, FRONTEND_URL (comma-separated CORS origins)
