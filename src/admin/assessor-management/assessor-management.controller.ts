@@ -16,9 +16,7 @@ import {
   ValidationPipe,
 } from '@nestjs/common';
 import { AnyFilesInterceptor } from '@nestjs/platform-express';
-import { diskStorage } from 'multer';
-import { extname } from 'node:path';
-import { existsSync, mkdirSync } from 'node:fs';
+import { multerMemoryOptions } from '../../common/multer-memory';
 import { ValidationError } from 'class-validator';
 import { AssessorManagementService } from './assessor-management.service';
 import { CreateAssessorDto } from './dto/create-assessor.dto';
@@ -66,20 +64,7 @@ export class AssessorManagementController {
   @Put('assessors/:id')
   @HttpCode(HttpStatus.OK)
   @UseInterceptors(
-    AnyFilesInterceptor({
-      storage: diskStorage({
-        destination: (_req, _file, cb) => {
-          const uploadPath = 'uploads/assessors';
-          if (!existsSync(uploadPath)) mkdirSync(uploadPath, { recursive: true });
-          cb(null, uploadPath);
-        },
-        filename: (_req, file, cb) => {
-          const suffix = `${Date.now()}-${Math.round(Math.random() * 1e9)}`;
-          const safeField = file.fieldname.replaceAll(/[^a-zA-Z0-9_-]/g, '');
-          cb(null, `${safeField}-${suffix}${extname(file.originalname)}`);
-        },
-      }),
-    }),
+    AnyFilesInterceptor(multerMemoryOptions()),
   )
   @UsePipes(
     new ValidationPipe({

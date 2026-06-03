@@ -59,9 +59,11 @@ import { NotificationsModule } from '../notifications/notifications.module';
 import { MailModule } from '../../mail/mail.module';
 import { RegistrationMastersModule } from '../registration-masters/registration-masters.module';
 import { AdminAuthModule } from '../../admin/admin-auth/admin-auth.module';
+import { S3Module } from '../../s3/s3.module';
 
 @Module({
   imports: [
+    S3Module,
     AdminAuthModule,
     NotificationsModule,
     MailModule,

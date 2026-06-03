@@ -20,13 +20,11 @@ import {
 import { Response } from 'express';
 import { AnyFilesInterceptor, FileFieldsInterceptor, FileInterceptor } from '@nestjs/platform-express';
 import { UploadedFile } from '@nestjs/common';
-import { diskStorage, memoryStorage } from 'multer';
 import { extname } from 'path';
+import { multerMemoryOptions } from '../../common/multer-memory';
 import { CompanyProjectsService } from './company-projects.service';
 import { JwtAuthGuard } from '../company-auth/guards/jwt-auth.guard';
 import { AccountStatusGuard } from '../company-auth/guards/account-status.guard';
-import { join } from 'path';
-import * as fs from 'fs';
 import { CompleteMilestoneDto } from './dto/complete-milestone.dto';
 import { RegistrationInfoDto } from './dto/registration-info.dto';
 import { ApproveWorkOrderDto } from './dto/approve-workorder.dto';
@@ -119,20 +117,12 @@ export class CompanyProjectsController {
   ) {
     console.log(`[ScoreBand Download] Request received for projectId: ${projectId}`);
     try {
-      const pdfPath = await this.companyProjectsService.getScoreBandPdfPath(
+      const url = await this.companyProjectsService.getScoreBandDownloadUrl(
         req.user.userId,
         projectId,
       );
 
-      console.log(`[ScoreBand Download] PDF path: ${pdfPath}`);
-
-      res.setHeader('Content-Type', 'application/pdf');
-      res.setHeader(
-        'Content-Disposition',
-        'attachment; filename="Score_Band.pdf"',
-      );
-
-      return res.sendFile(pdfPath);
+      return res.redirect(url);
     } catch (error) {
       console.error(`[ScoreBand Download] Error:`, error);
       // If it's already a NotFoundException with proper format, re-throw it
@@ -166,22 +156,16 @@ export class CompanyProjectsController {
       });
     }
 
-    const filePath = join(process.cwd(), project.certificate_document_url);
-
-    if (!fs.existsSync(filePath)) {
+    const url = await this.companyProjectsService.resolveStoredDownloadUrl(
+      project.certificate_document_url,
+    );
+    if (!url) {
       throw new NotFoundException({
         status: 'error',
-        message: 'Certificate file not found on server',
+        message: 'Certificate file not found',
       });
     }
-
-    res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader(
-      'Content-Disposition',
-      `inline; filename="${project.certificate_document_filename || 'certificate.pdf'}"`,
-    );
-
-    return res.sendFile(filePath);
+    return res.redirect(url);
   }
 
   @Get(':projectId/feedback-document')
@@ -203,22 +187,16 @@ export class CompanyProjectsController {
       });
     }
 
-    const filePath = join(process.cwd(), project.feedback_document_url);
-
-    if (!fs.existsSync(filePath)) {
+    const url = await this.companyProjectsService.resolveStoredDownloadUrl(
+      project.feedback_document_url,
+    );
+    if (!url) {
       throw new NotFoundException({
         status: 'error',
-        message: 'Feedback file not found on server',
+        message: 'Feedback file not found',
       });
     }
-
-    res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader(
-      'Content-Disposition',
-      `inline; filename="${project.feedback_document_filename || 'feedback.pdf'}"`,
-    );
-
-    return res.sendFile(filePath);
+    return res.redirect(url);
   }
 
   @Get(':projectId/certificate')
@@ -242,20 +220,7 @@ export class CompanyProjectsController {
   @UseGuards(JwtAuthGuard, AccountStatusGuard)
   @UseInterceptors(
     FileInterceptor('certificate_upload', {
-      storage: diskStorage({
-        destination: (req, file, cb) => {
-          const projectId = req.params.projectId;
-          const uploadPath = join(process.cwd(), 'uploads', 'company_certificate', projectId);
-          if (!fs.existsSync(uploadPath)) {
-            fs.mkdirSync(uploadPath, { recursive: true });
-          }
-          cb(null, uploadPath);
-        },
-        filename: (req, file, cb) => {
-          const ext = extname(file.originalname) || '.pdf';
-          cb(null, `${Date.now()}${ext}`);
-        },
-      }),
+      ...multerMemoryOptions(),
       limits: { fileSize: 10 * 1024 * 1024 },
       fileFilter: (req, file, cb) => {
         if (file.mimetype === 'application/pdf') {
@@ -290,20 +255,7 @@ export class CompanyProjectsController {
   @UseGuards(JwtAuthGuard, AccountStatusGuard)
   @UseInterceptors(
     FileInterceptor('feedback_upload', {
-      storage: diskStorage({
-        destination: (req, file, cb) => {
-          const projectId = req.params.projectId;
-          const uploadPath = join(process.cwd(), 'uploads', 'company_feedback', projectId);
-          if (!fs.existsSync(uploadPath)) {
-            fs.mkdirSync(uploadPath, { recursive: true });
-          }
-          cb(null, uploadPath);
-        },
-        filename: (req, file, cb) => {
-          const ext = extname(file.originalname) || '.pdf';
-          cb(null, `${Date.now()}${ext}`);
-        },
-      }),
+      ...multerMemoryOptions(),
       limits: { fileSize: 10 * 1024 * 1024 },
       fileFilter: (req, file, cb) => {
         if (file.mimetype === 'application/pdf') {
@@ -448,43 +400,7 @@ export class CompanyProjectsController {
         { name: 'sez_input', maxCount: 1 }, // Alternative field name
       ],
       {
-      storage: diskStorage({
-        destination: (req, file, cb) => {
-          console.log('[File Upload Interceptor] ====== INTERCEPTOR RUNNING ======');
-          console.log('[File Upload Interceptor] Destination callback called', {
-            contentType: req.headers['content-type'],
-            fieldname: file.fieldname,
-            originalname: file.originalname,
-            mimetype: file.mimetype,
-            size: file.size,
-          });
-          const projectId = req.params.projectId;
-          const uploadPath = join(process.cwd(), 'uploads', 'registration', projectId);
-          // Create directory if it doesn't exist
-          if (!fs.existsSync(uploadPath)) {
-            fs.mkdirSync(uploadPath, { recursive: true });
-            console.log(`[File Upload] Created directory: ${uploadPath}`);
-          }
-          console.log(`[File Upload] Saving file to: ${uploadPath}`, {
-            fieldname: file.fieldname,
-            originalname: file.originalname,
-          });
-          cb(null, uploadPath);
-        },
-        filename: (req, file, cb) => {
-          // Generate unique filename: fieldname-timestamp.extension
-          const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1e9);
-          const ext = extname(file.originalname);
-          const fieldName = file.fieldname || 'file';
-          const filename = `${fieldName}-${uniqueSuffix}${ext}`;
-          console.log(`[File Upload] Generated filename: ${filename}`, {
-            originalname: file.originalname,
-            fieldname: file.fieldname,
-            extension: ext,
-          });
-          cb(null, filename);
-        },
-      }),
+      ...multerMemoryOptions(),
       limits: {
         fileSize: 10 * 1024 * 1024, // 10MB max file size
       },
@@ -934,35 +850,14 @@ export class CompanyProjectsController {
       });
     }
 
-    // Extract relative path from URL if it's a full URL
-    const relativePath = filePath.startsWith('http')
-      ? filePath.replace(/^https?:\/\/[^/]+/, '').replace(/^\//, '')
-      : filePath;
-
-    const fullPath = join(process.cwd(), relativePath);
-
-    if (!fs.existsSync(fullPath)) {
+    const url = await this.companyProjectsService.resolveStoredDownloadUrl(filePath);
+    if (!url) {
       throw new NotFoundException({
         status: 'error',
-        message: 'File not found on server',
+        message: 'File not found',
       });
     }
-
-    // Determine content type based on file extension
-    const ext = extname(filename).toLowerCase();
-    const contentTypes: Record<string, string> = {
-      '.pdf': 'application/pdf',
-      '.doc': 'application/msword',
-      '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-      '.jpg': 'image/jpeg',
-      '.jpeg': 'image/jpeg',
-      '.png': 'image/png',
-    };
-
-    res.setHeader('Content-Type', contentTypes[ext] || 'application/octet-stream');
-    res.setHeader('Content-Disposition', `inline; filename="${filename}"`);
-
-    return res.sendFile(fullPath);
+    return res.redirect(url);
   }
 
   /**
@@ -973,25 +868,7 @@ export class CompanyProjectsController {
   @UseGuards(AdminJwtAuthGuard)
   @UseInterceptors(
     FileInterceptor('proposal_document', {
-      storage: diskStorage({
-        destination: (req, file, cb) => {
-          const projectId = req.params.projectId;
-          // Use Laravel-compatible path: uploads/company/{projectId}/
-          const uploadPath = join(process.cwd(), 'uploads', 'company', projectId);
-          if (!fs.existsSync(uploadPath)) {
-            fs.mkdirSync(uploadPath, { recursive: true });
-            console.log(`[Proposal Document] Created directory: ${uploadPath}`);
-          }
-          cb(null, uploadPath);
-        },
-        filename: (req, file, cb) => {
-          const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1e9);
-          const ext = extname(file.originalname);
-          const filename = `proposal-${uniqueSuffix}${ext}`;
-          console.log(`[Proposal Document] Generated filename: ${filename}`);
-          cb(null, filename);
-        },
-      }),
+      ...multerMemoryOptions(),
       limits: {
         fileSize: 10 * 1024 * 1024, // 10MB max file size
       },
@@ -1037,21 +914,7 @@ export class CompanyProjectsController {
   @UseGuards(AdminJwtAuthGuard)
   @UseInterceptors(
     FileInterceptor('proposal_document', {
-      storage: diskStorage({
-        destination: (req, file, cb) => {
-          const projectId = req.params.projectId;
-          const uploadPath = join(process.cwd(), 'uploads', 'company', projectId);
-          if (!fs.existsSync(uploadPath)) {
-            fs.mkdirSync(uploadPath, { recursive: true });
-          }
-          cb(null, uploadPath);
-        },
-        filename: (req, file, cb) => {
-          const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1e9);
-          const ext = extname(file.originalname);
-          cb(null, `proposal-${uniqueSuffix}${ext}`);
-        },
-      }),
+      ...multerMemoryOptions(),
       limits: { fileSize: 10 * 1024 * 1024 },
       fileFilter: (req, file, cb) => {
         const allowedMimes = [
@@ -1196,19 +1059,13 @@ export class CompanyProjectsController {
     @Query('v') _cacheBust: string | undefined,
     @Res() res: Response,
   ): Promise<void> {
-    const { fullPath, filename, ext } =
-      await this.companyProjectsService.getProposalDocumentLocalFilePathOrThrow(
+    const { url, filename } =
+      await this.companyProjectsService.getProposalDocumentDownloadUrlOrThrow(
         req.user.userId,
         projectId,
       );
-    const contentTypes: Record<string, string> = {
-      '.pdf': 'application/pdf',
-      '.doc': 'application/msword',
-      '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-    };
-    res.setHeader('Content-Type', contentTypes[ext] || 'application/octet-stream');
     res.setHeader('Content-Disposition', `inline; filename="${filename}"`);
-    res.sendFile(fullPath);
+    res.redirect(url);
   }
 
   /**
@@ -1246,24 +1103,7 @@ export class CompanyProjectsController {
   @UseGuards(JwtAuthGuard, AccountStatusGuard)
   @UseInterceptors(
     FileInterceptor('resource_document', {
-      storage: diskStorage({
-        destination: (req, file, cb) => {
-          const projectId = req.params.projectId;
-          const uploadPath = join(process.cwd(), 'uploads', 'resources', projectId);
-          if (!fs.existsSync(uploadPath)) {
-            fs.mkdirSync(uploadPath, { recursive: true });
-            console.log(`[Resource Document] Created directory: ${uploadPath}`);
-          }
-          cb(null, uploadPath);
-        },
-        filename: (req, file, cb) => {
-          const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1e9);
-          const ext = extname(file.originalname);
-          const filename = `resource-${uniqueSuffix}${ext}`;
-          console.log(`[Resource Document] Generated filename: ${filename}`);
-          cb(null, filename);
-        },
-      }),
+      ...multerMemoryOptions(),
       limits: {
         fileSize: 10 * 1024 * 1024, // 10MB max file size
       },
@@ -1461,38 +1301,7 @@ export class CompanyProjectsController {
   @UseGuards(JwtAuthGuard, AccountStatusGuard)
   @UseInterceptors(
     FileInterceptor('launch_upload', {
-      storage: diskStorage({
-        destination: (req, file, cb) => {
-          const companyId = (req as any).user?.userId;
-          if (!companyId) {
-            cb(new Error('Unauthorized'), '');
-            return;
-          }
-          const uploadPath = join(
-            process.cwd(),
-            'uploads',
-            'companyproject',
-            'launchAndTraining',
-            companyId,
-          );
-          if (!fs.existsSync(uploadPath)) {
-            fs.mkdirSync(uploadPath, { recursive: true });
-          }
-          cb(null, uploadPath);
-        },
-        filename: (req, file, cb) => {
-          const now = new Date();
-          const ymdhis =
-            now.getFullYear() +
-            String(now.getMonth() + 1).padStart(2, '0') +
-            String(now.getDate()).padStart(2, '0') +
-            String(now.getHours()).padStart(2, '0') +
-            String(now.getMinutes()).padStart(2, '0') +
-            String(now.getSeconds()).padStart(2, '0');
-          const filename = `${ymdhis}_${file.originalname}`;
-          cb(null, filename);
-        },
-      }),
+      ...multerMemoryOptions(),
       limits: { fileSize: 10 * 1024 * 1024 },
       fileFilter: (req, file, cb) => {
         if (file.mimetype === 'application/pdf') {
@@ -1532,8 +1341,7 @@ export class CompanyProjectsController {
   @UseGuards(AdminJwtAuthGuard)
   @UseInterceptors(
     FileInterceptor('launch_upload', {
-      storage: memoryStorage(),
-      limits: { fileSize: 10 * 1024 * 1024 },
+      ...multerMemoryOptions(),
       fileFilter: (req, file, cb) => {
         if (file.mimetype === 'application/pdf') {
           cb(null, true);
@@ -1568,38 +1376,7 @@ export class CompanyProjectsController {
   @UseGuards(JwtAuthGuard, AccountStatusGuard)
   @UseInterceptors(
     FileInterceptor('launch_upload', {
-      storage: diskStorage({
-        destination: (req, file, cb) => {
-          const companyId = (req as any).user?.userId;
-          if (!companyId) {
-            cb(new Error('Unauthorized'), '');
-            return;
-          }
-          const uploadPath = join(
-            process.cwd(),
-            'uploads',
-            'companyproject',
-            'launchAndTraining',
-            companyId,
-          );
-          if (!fs.existsSync(uploadPath)) {
-            fs.mkdirSync(uploadPath, { recursive: true });
-          }
-          cb(null, uploadPath);
-        },
-        filename: (req, file, cb) => {
-          const now = new Date();
-          const ymdhis =
-            now.getFullYear() +
-            String(now.getMonth() + 1).padStart(2, '0') +
-            String(now.getDate()).padStart(2, '0') +
-            String(now.getHours()).padStart(2, '0') +
-            String(now.getMinutes()).padStart(2, '0') +
-            String(now.getSeconds()).padStart(2, '0');
-          const filename = `${ymdhis}_${file.originalname}`;
-          cb(null, filename);
-        },
-      }),
+      ...multerMemoryOptions(),
       limits: { fileSize: 10 * 1024 * 1024 },
       fileFilter: (req, file, cb) => {
         if (file.mimetype === 'application/pdf') {
@@ -1638,8 +1415,7 @@ export class CompanyProjectsController {
   @UseGuards(AdminJwtAuthGuard)
   @UseInterceptors(
     FileInterceptor('launch_upload', {
-      storage: memoryStorage(),
-      limits: { fileSize: 10 * 1024 * 1024 },
+      ...multerMemoryOptions(),
       fileFilter: (req, file, cb) => {
         if (file.mimetype === 'application/pdf') {
           cb(null, true);
@@ -1886,8 +1662,7 @@ export class CompanyProjectsController {
   @UseGuards(JwtAuthGuard, AccountStatusGuard)
   @UseInterceptors(
     FileInterceptor('file', {
-      storage: memoryStorage(),
-      limits: { fileSize: 10 * 1024 * 1024 },
+      ...multerMemoryOptions(),
       fileFilter: (req, file, cb) => {
         const ok =
           file.mimetype === 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' ||
@@ -1978,21 +1753,7 @@ export class CompanyProjectsController {
   @UseGuards(JwtAuthGuard, AccountStatusGuard)
   @UseInterceptors(
     FileInterceptor('invoice_document', {
-      storage: diskStorage({
-        destination: (req, file, cb) => {
-          const companyId = (req as any).user?.userId;
-          const uploadPath = join(process.cwd(), 'uploads', 'company', companyId || 'unknown', 'invoices');
-          if (!fs.existsSync(uploadPath)) {
-            fs.mkdirSync(uploadPath, { recursive: true });
-          }
-          cb(null, uploadPath);
-        },
-        filename: (req, file, cb) => {
-          const paymentFor = (req as any).body?.payment_for === 'inv' ? 'tax' : 'proforma';
-          const ext = extname(file.originalname);
-          cb(null, `${paymentFor}-${Date.now()}${ext}`);
-        },
-      }),
+      ...multerMemoryOptions(),
       limits: { fileSize: 10 * 1024 * 1024 },
       fileFilter: (req, file, cb) => {
         const allowed = [
@@ -2041,21 +1802,7 @@ export class CompanyProjectsController {
   @UsePipes(new ValidationPipe({ transform: true, whitelist: true }))
   @UseInterceptors(
     FileInterceptor('supportingdocument', {
-      storage: diskStorage({
-        destination: (req, file, cb) => {
-          const companyId = (req as any).user?.userId;
-          const uploadPath = join(process.cwd(), 'uploads', 'company', companyId || 'unknown');
-          if (!fs.existsSync(uploadPath)) {
-            fs.mkdirSync(uploadPath, { recursive: true });
-          }
-          cb(null, uploadPath);
-        },
-        filename: (req, file, cb) => {
-          const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1e9);
-          const ext = extname(file.originalname);
-          cb(null, `payment-${uniqueSuffix}${ext}`);
-        },
-      }),
+      ...multerMemoryOptions(),
       limits: { fileSize: 10 * 1024 * 1024 },
       fileFilter: (req, file, cb) => {
         const allowed = [
@@ -2140,21 +1887,7 @@ export class CompanyProjectsController {
   @UsePipes(new ValidationPipe({ transform: true, whitelist: true }))
   @UseInterceptors(
     AnyFilesInterceptor({
-      storage: diskStorage({
-        destination: (req, file, cb) => {
-          const companyId = (req as any).user?.userId;
-          const uploadPath = join(process.cwd(), 'uploads', 'company', companyId || 'unknown');
-          if (!fs.existsSync(uploadPath)) {
-            fs.mkdirSync(uploadPath, { recursive: true });
-          }
-          cb(null, uploadPath);
-        },
-        filename: (req, file, cb) => {
-          const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1e9);
-          const ext = extname(file.originalname);
-          cb(null, `payment-${uniqueSuffix}${ext}`);
-        },
-      }),
+      ...multerMemoryOptions(),
       limits: { fileSize: 10 * 1024 * 1024 },
       fileFilter: (req, file, cb) => {
         const allowed = ['application/pdf', 'image/jpeg', 'image/jpg', 'image/png'];
@@ -2185,21 +1918,7 @@ export class CompanyProjectsController {
   @UsePipes(new ValidationPipe({ transform: true, whitelist: true }))
   @UseInterceptors(
     AnyFilesInterceptor({
-      storage: diskStorage({
-        destination: (req, file, cb) => {
-          const companyId = (req as any).user?.userId;
-          const uploadPath = join(process.cwd(), 'uploads', 'company', companyId || 'unknown');
-          if (!fs.existsSync(uploadPath)) {
-            fs.mkdirSync(uploadPath, { recursive: true });
-          }
-          cb(null, uploadPath);
-        },
-        filename: (req, file, cb) => {
-          const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1e9);
-          const ext = extname(file.originalname);
-          cb(null, `payment-${uniqueSuffix}${ext}`);
-        },
-      }),
+      ...multerMemoryOptions(),
       limits: { fileSize: 10 * 1024 * 1024 },
       fileFilter: (req, file, cb) => {
         const allowed = ['application/pdf', 'image/jpeg', 'image/jpg', 'image/png'];
@@ -2234,21 +1953,7 @@ export class CompanyProjectsController {
   @UsePipes(new ValidationPipe({ transform: true, whitelist: true }))
   @UseInterceptors(
     AnyFilesInterceptor({
-      storage: diskStorage({
-        destination: (req, file, cb) => {
-          const companyId = (req as any).user?.userId;
-          const uploadPath = join(process.cwd(), 'uploads', 'company', companyId || 'unknown');
-          if (!fs.existsSync(uploadPath)) {
-            fs.mkdirSync(uploadPath, { recursive: true });
-          }
-          cb(null, uploadPath);
-        },
-        filename: (req, file, cb) => {
-          const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1e9);
-          const ext = extname(file.originalname);
-          cb(null, `payment-${uniqueSuffix}${ext}`);
-        },
-      }),
+      ...multerMemoryOptions(),
       limits: { fileSize: 10 * 1024 * 1024 },
       fileFilter: (req, file, cb) => {
         const allowed = ['application/pdf', 'image/jpeg', 'image/jpg', 'image/png'];
@@ -2286,21 +1991,7 @@ export class CompanyProjectsController {
   @UsePipes(new ValidationPipe({ transform: true, whitelist: true }))
   @UseInterceptors(
     AnyFilesInterceptor({
-      storage: diskStorage({
-        destination: (req, file, cb) => {
-          const companyId = (req as any).user?.userId;
-          const uploadPath = join(process.cwd(), 'uploads', 'company', companyId || 'unknown');
-          if (!fs.existsSync(uploadPath)) {
-            fs.mkdirSync(uploadPath, { recursive: true });
-          }
-          cb(null, uploadPath);
-        },
-        filename: (req, file, cb) => {
-          const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1e9);
-          const ext = extname(file.originalname);
-          cb(null, `payment-${uniqueSuffix}${ext}`);
-        },
-      }),
+      ...multerMemoryOptions(),
       limits: { fileSize: 10 * 1024 * 1024 },
       fileFilter: (req, file, cb) => {
         const allowed = ['application/pdf', 'image/jpeg', 'image/jpg', 'image/png'];
@@ -2339,21 +2030,7 @@ export class CompanyProjectsController {
   @UsePipes(new ValidationPipe({ transform: true, whitelist: true }))
   @UseInterceptors(
     AnyFilesInterceptor({
-      storage: diskStorage({
-        destination: (req, file, cb) => {
-          const companyId = (req as any).user?.userId;
-          const uploadPath = join(process.cwd(), 'uploads', 'company', companyId || 'unknown');
-          if (!fs.existsSync(uploadPath)) {
-            fs.mkdirSync(uploadPath, { recursive: true });
-          }
-          cb(null, uploadPath);
-        },
-        filename: (req, file, cb) => {
-          const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1e9);
-          const ext = extname(file.originalname);
-          cb(null, `payment-${uniqueSuffix}${ext}`);
-        },
-      }),
+      ...multerMemoryOptions(),
       limits: { fileSize: 10 * 1024 * 1024 },
       fileFilter: (req, file, cb) => {
         const allowed = ['application/pdf', 'image/jpeg', 'image/jpg', 'image/png'];
@@ -2562,25 +2239,7 @@ export class CompanyProjectsController {
   @UseGuards(JwtAuthGuard, AccountStatusGuard)
   @UseInterceptors(
     FileInterceptor('workorderdocument', {
-      storage: diskStorage({
-        destination: (req, file, cb) => {
-          const projectId = req.params.projectId;
-          // Use Laravel-compatible path: uploads/companyproject/{projectId}/
-          const uploadPath = join(process.cwd(), 'uploads', 'companyproject', projectId);
-          if (!fs.existsSync(uploadPath)) {
-            fs.mkdirSync(uploadPath, { recursive: true });
-            console.log(`[Work Order Upload] Created directory: ${uploadPath}`);
-          }
-          cb(null, uploadPath);
-        },
-        filename: (req, file, cb) => {
-          const timestamp = Date.now();
-          const ext = extname(file.originalname);
-          const filename = `${timestamp}_${file.originalname}`;
-          console.log(`[Work Order Upload] Generated filename: ${filename}`);
-          cb(null, filename);
-        },
-      }),
+      ...multerMemoryOptions(),
       limits: {
         fileSize: 10 * 1024 * 1024, // 10MB max file size
       },
@@ -2781,21 +2440,7 @@ export class CompanyProjectsController {
   @UseGuards(JwtAuthGuard, AccountStatusGuard)
   @UseInterceptors(
     FileInterceptor('contract_document', {
-      storage: diskStorage({
-        destination: (req, file, cb) => {
-          const projectId = req.params.projectId;
-          const uploadPath = join(process.cwd(), 'uploads', 'facilitator-contracts', projectId);
-          if (!fs.existsSync(uploadPath)) {
-            fs.mkdirSync(uploadPath, { recursive: true });
-          }
-          cb(null, uploadPath);
-        },
-        filename: (req, file, cb) => {
-          const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1e9);
-          const ext = extname(file.originalname);
-          cb(null, `contract-${uniqueSuffix}${ext}`);
-        },
-      }),
+      ...multerMemoryOptions(),
       fileFilter: (req, file, cb) => {
         // Allow PDF and image files
         if (file.mimetype === 'application/pdf' || file.mimetype.startsWith('image/')) {

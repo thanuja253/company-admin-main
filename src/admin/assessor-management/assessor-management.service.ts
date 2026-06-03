@@ -3,7 +3,9 @@ import {
   ConflictException,
   Injectable,
   NotFoundException,
+  ServiceUnavailableException,
 } from '@nestjs/common';
+import { S3Service } from '../../s3/s3.service';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model, Types } from 'mongoose';
 import * as bcrypt from 'bcryptjs';
@@ -24,9 +26,10 @@ export class AssessorManagementService {
     @InjectModel(Assessor.name) private readonly assessorModel: Model<AssessorDocument>,
     @InjectModel(State.name) private readonly stateModel: Model<StateDocument>,
     @InjectModel(Industry.name) private readonly industryModel: Model<IndustryDocument>,
+    private readonly s3Service: S3Service,
   ) {}
 
-  private mapAssessor(item: any) {
+  private async mapAssessor(item: any) {
     const id = item?._id?.toString?.() || item?.id?.toString?.() || '';
     const verification = String(
       item?.verification_status ?? item?.verificationStatus ?? '0',
@@ -34,9 +37,10 @@ export class AssessorManagementService {
     const profileUpdated = String(item?.profile_updated ?? '0');
     const verificationNum = verification === '1' ? 1 : 0;
     const profileUpdatedNum = profileUpdated === '1' ? 1 : 0;
-    const withAssetUrl = (value: string | undefined) => {
+    const withAssetUrl = async (value: string | undefined) => {
       if (!value) return '';
-      return String(value).startsWith('/uploads/') ? value : `/uploads/${value}`;
+      const resolved = await this.s3Service.resolvePublicUrl(String(value).trim());
+      return resolved || '';
     };
     return {
       ...item,
@@ -55,28 +59,34 @@ export class AssessorManagementService {
       profile_updated_num: profileUpdatedNum,
       profileStatus: profileUpdatedNum === 1 ? 'Completed' : 'Pending',
       can_view: profileUpdatedNum === 1,
-      company_logo_url: withAssetUrl(item?.company_logo || item?.profile_image),
-      profile_image_url: withAssetUrl(item?.profile_image || item?.company_logo),
-      cancelled_check_url: withAssetUrl(
+      company_logo_url: await withAssetUrl(item?.company_logo || item?.profile_image),
+      profile_image_url: await withAssetUrl(item?.profile_image || item?.company_logo),
+      cancelled_check_url: await withAssetUrl(
         item?.cancelled_check || item?.cancelled_cheque || item?.cancel_check,
       ),
-      cancel_check_url: withAssetUrl(
+      cancel_check_url: await withAssetUrl(
         item?.cancel_check || item?.cancelled_check || item?.cancelled_cheque,
       ),
-      health_doc_url: withAssetUrl(item?.health_doc || item?.health_document),
-      health_document_url: withAssetUrl(item?.health_document || item?.health_doc),
-      gst_form_url: withAssetUrl(item?.gst_form),
-      vendor_stamp_url: withAssetUrl(item?.vendor_stamp || item?.vendorstamp),
-      ndc_form_url: withAssetUrl(item?.ndc_form || item?.ndc),
-      pan_url: withAssetUrl(item?.pan),
-      biodata_url: withAssetUrl(item?.biodata),
+      health_doc_url: await withAssetUrl(item?.health_doc || item?.health_document),
+      health_document_url: await withAssetUrl(item?.health_document || item?.health_doc),
+      gst_form_url: await withAssetUrl(item?.gst_form),
+      vendor_stamp_url: await withAssetUrl(item?.vendor_stamp || item?.vendorstamp),
+      ndc_form_url: await withAssetUrl(item?.ndc_form || item?.ndc),
+      pan_url: await withAssetUrl(item?.pan),
+      biodata_url: await withAssetUrl(item?.biodata),
     };
   }
 
-  private applyUploadedFiles(
+  private async applyUploadedFiles(
     payload: Record<string, any>,
     files: Express.Multer.File[] = [],
   ) {
+    if (files.length && !this.s3Service.isConfigured()) {
+      throw new ServiceUnavailableException({
+        status: 'error',
+        message: 'S3 is not configured on the server.',
+      });
+    }
     const fieldToSchemaKey: Record<string, string> = {
       company_logo: 'company_logo',
       profile_image: 'company_logo',
@@ -96,7 +106,7 @@ export class AssessorManagementService {
     for (const f of files) {
       const schemaKey = fieldToSchemaKey[f.fieldname];
       if (!schemaKey) continue;
-      payload[schemaKey] = `assessors/${f.filename}`;
+      payload[schemaKey] = await this.s3Service.storeMulterFile(f, 'assessors');
     }
   }
 
@@ -542,7 +552,9 @@ export class AssessorManagementService {
     return {
       status: 'success',
       data: {
-        items: (items as any[]).map((i) => this.mapAssessor(i.toObject ? i.toObject() : i)),
+        items: await Promise.all(
+          (items as any[]).map((i) => this.mapAssessor(i.toObject ? i.toObject() : i)),
+        ),
         total,
         page,
         limit,
@@ -587,7 +599,7 @@ export class AssessorManagementService {
 
     return {
       status: 'success',
-      data: this.mapAssessor(assessor.toObject ? assessor.toObject() : assessor),
+      data: await this.mapAssessor(assessor.toObject ? assessor.toObject() : assessor),
     };
   }
 
@@ -609,7 +621,7 @@ export class AssessorManagementService {
     }
 
     const updatePayload = this.buildUpdatePayload(dto);
-    this.applyUploadedFiles(updatePayload, files);
+    await this.applyUploadedFiles(updatePayload, files);
     // Some UIs submit "finalSubmit" flag instead of profile_updated/profileStatus.
     const maybeFinalSubmit =
       (dto as any)?.finalSubmit ??
@@ -657,7 +669,7 @@ export class AssessorManagementService {
     return {
       status: 'success',
       message: 'Assessor updated successfully',
-      data: this.mapAssessor(updated?.toObject ? updated.toObject() : updated),
+      data: await this.mapAssessor(updated?.toObject ? updated.toObject() : updated),
     };
   }
 }

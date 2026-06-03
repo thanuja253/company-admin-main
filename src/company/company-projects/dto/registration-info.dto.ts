@@ -146,6 +146,19 @@ export class RegistrationInfoDto {
   turnover_document?: any;
 
   brief_profile?: any; // Alternative field name for company_brief_profile
+
+  /** After presigned S3 upload — saved as s3:… in registration_info */
+  @IsOptional()
+  @IsString()
+  company_brief_profile_s3_key?: string;
+
+  @IsOptional()
+  @IsString()
+  turnover_document_s3_key?: string;
+
+  @IsOptional()
+  @IsString()
+  sez_document_s3_key?: string;
 }
 
 

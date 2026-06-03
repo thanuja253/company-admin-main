@@ -1,5 +1,10 @@
 /// <reference path="../../exceljs.d.ts" />
-import { Injectable, NotFoundException, BadRequestException } from '@nestjs/common';
+import {
+  Injectable,
+  NotFoundException,
+  BadRequestException,
+  ServiceUnavailableException,
+} from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model, Types } from 'mongoose';
 import {
@@ -82,6 +87,7 @@ import {
   TAR_CALCULATED_CHECKLIST_ORDERS,
   applyTarCalculationsByOrder,
 } from './utils/ee-calc';
+import { S3Service } from '../../s3/s3.service';
 
 function parseUtcCalendarDateFromYmd(input: string): Date {
   const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(input || '').trim());
@@ -198,7 +204,95 @@ export class CompanyProjectsService {
     private readonly notificationsService: NotificationsService,
     private readonly mailService: MailService,
     private readonly registrationMastersService: RegistrationMastersService,
+    private readonly s3Service: S3Service,
   ) {}
+
+  private ensureS3Configured(): void {
+    if (!this.s3Service.isConfigured()) {
+      throw new ServiceUnavailableException({
+        status: 'error',
+        message: 'S3 is not configured on the server.',
+      });
+    }
+  }
+
+  /** Upload file to S3 and return `s3:…` value for persistence. */
+  private async persistUpload(
+    file: Express.Multer.File,
+    folder: string,
+  ): Promise<string> {
+    this.ensureS3Configured();
+    return this.s3Service.storeMulterFile(file, folder);
+  }
+
+  /** Normalize DB/http/local refs and resolve a browser-ready download URL. */
+  async resolveStoredDownloadUrl(
+    stored: string | null | undefined,
+  ): Promise<string | null> {
+    if (!stored || !String(stored).trim()) {
+      return null;
+    }
+    let value = String(stored).trim();
+    if (value.startsWith('http://') || value.startsWith('https://')) {
+      const uploadsIdx = value.indexOf('/uploads/');
+      if (uploadsIdx >= 0) {
+        value = value.slice(uploadsIdx + 1);
+      } else {
+        return value;
+      }
+    }
+    value = value.replace(/^\//, '');
+    if (!S3Service.isS3StorageValue(value) && !value.startsWith('uploads/')) {
+      value = S3Service.toStorageValue(value);
+    }
+    return this.s3Service.resolvePublicUrl(value);
+  }
+
+  private async registrationFileView(
+    storedUrl: string,
+    filename: string,
+    _localDownloadPath: string,
+    _baseUrl: string,
+  ): Promise<{ url: string; filename: string; downloadUrl: string; storage: 's3' | 'local' }> {
+    const downloadUrl = (await this.resolveStoredDownloadUrl(storedUrl)) || storedUrl;
+    const storage: 's3' | 'local' = S3Service.isS3StorageValue(storedUrl) ? 's3' : 'local';
+    return {
+      url: storedUrl,
+      filename,
+      downloadUrl,
+      storage,
+    };
+  }
+
+  /** Accept presigned-upload keys from JSON body (company_brief_profile_s3_key, etc.). */
+  private applyS3RegistrationFileFields(normalizedData: Record<string, any>): void {
+    const pairs: Array<[s3KeyField: string, urlField: string, nameField: string]> = [
+      ['company_brief_profile_s3_key', 'company_brief_profile_url', 'company_brief_profile_filename'],
+      ['turnover_document_s3_key', 'turnover_document_url', 'turnover_document_filename'],
+      ['sez_document_s3_key', 'sez_document_url', 'sez_document_filename'],
+    ];
+    for (const [s3KeyField, urlField, nameField] of pairs) {
+      const rawKey = normalizedData[s3KeyField];
+      if (typeof rawKey === 'string' && rawKey.trim()) {
+        normalizedData[urlField] = S3Service.toStorageValue(rawKey.trim());
+      }
+      delete normalizedData[s3KeyField];
+      const existingUrl = normalizedData[urlField];
+      if (typeof existingUrl === 'string' && existingUrl.trim() && !existingUrl.startsWith('http')) {
+        if (!S3Service.isS3StorageValue(existingUrl) && !existingUrl.startsWith('uploads/')) {
+          normalizedData[urlField] = S3Service.toStorageValue(existingUrl.trim());
+        } else if (S3Service.isS3StorageValue(existingUrl)) {
+          normalizedData[urlField] = existingUrl.trim();
+        }
+      }
+      if (!normalizedData[nameField] && normalizedData[urlField]) {
+        const keyPart = S3Service.isS3StorageValue(normalizedData[urlField])
+          ? S3Service.toS3Key(normalizedData[urlField])
+          : String(normalizedData[urlField]);
+        normalizedData[nameField] = keyPart.split('/').pop() || nameField;
+      }
+    }
+  }
 
   /**
    * List projects for the logged-in company for the \"My Projects\" style listing.
@@ -423,7 +517,7 @@ export class CompanyProjectsService {
     return project;
   }
 
-  async getScoreBandPdfPath(companyId: string, projectId: string): Promise<string> {
+  async getScoreBandDownloadUrl(companyId: string, projectId: string): Promise<string> {
     const project = await this.projectModel.findOne({
       _id: projectId,
       company_id: companyId,
@@ -443,22 +537,20 @@ export class CompanyProjectsService {
       });
     }
 
-    const relativePath = project.score_band_pdf_path;
-    const absolutePath = join(process.cwd(), relativePath);
-
-    if (!fs.existsSync(absolutePath)) {
+    const url = await this.resolveStoredDownloadUrl(project.score_band_pdf_path);
+    if (!url) {
       throw new NotFoundException({
         status: 'error',
-        message: 'Score band PDF file not found on server',
+        message: 'Score band PDF file not found',
       });
     }
 
-    return absolutePath;
+    return url;
   }
 
   /**
    * Upload Plaque and Certificate PDF (Admin/Greenco Team).
-   * Saves to uploads/company_certificate/{projectId}/, updates project.
+   * Saves certificate PDF to S3, updates project.
    */
   async uploadCertificateDocument(
     companyId: string,
@@ -472,10 +564,13 @@ export class CompanyProjectsService {
     if (!project) {
       throw new NotFoundException({ status: 'error', message: 'Project not found' });
     }
-    const relativePath = `uploads/company_certificate/${projectId}/${file.filename}`;
+    const storageValue = await this.persistUpload(
+      file,
+      `company_certificate/${projectId}`,
+    );
     const expiry = new Date();
     expiry.setFullYear(expiry.getFullYear() + 3);
-    project.certificate_document_url = relativePath;
+    project.certificate_document_url = storageValue;
     project.certificate_document_filename = file.originalname || 'certificate.pdf';
     project.certificate_upload_date = new Date();
     project.certificate_expiry_date = expiry;
@@ -496,7 +591,7 @@ export class CompanyProjectsService {
       status: 'success',
       message: 'Certificate uploaded successfully',
       data: {
-        certificate_document_url: relativePath,
+        certificate_document_url: storageValue,
         certificate_document_filename: project.certificate_document_filename,
       },
     };
@@ -504,7 +599,7 @@ export class CompanyProjectsService {
 
   /**
    * Upload Feedback PDF (Admin/Greenco Team).
-   * Saves to uploads/company_feedback/{projectId}/, updates project.
+   * Saves feedback PDF to S3, updates project.
    */
   async uploadFeedbackDocument(
     companyId: string,
@@ -518,8 +613,8 @@ export class CompanyProjectsService {
     if (!project) {
       throw new NotFoundException({ status: 'error', message: 'Project not found' });
     }
-    const relativePath = `uploads/company_feedback/${projectId}/${file.filename}`;
-    project.feedback_document_url = relativePath;
+    const storageValue = await this.persistUpload(file, `company_feedback/${projectId}`);
+    project.feedback_document_url = storageValue;
     project.feedback_document_filename = file.originalname || 'feedback.pdf';
     project.feedback_upload_date = new Date();
     // Move main flow to milestone 23 (Feedback Report uploaded) → next 24 (close-out)
@@ -539,7 +634,7 @@ export class CompanyProjectsService {
       status: 'success',
       message: 'Feedback uploaded successfully',
       data: {
-        feedback_document_url: relativePath,
+        feedback_document_url: storageValue,
         feedback_document_filename: project.feedback_document_filename,
       },
     };
@@ -643,60 +738,44 @@ export class CompanyProjectsService {
       delete normalizedData.gstin_no;
     }
 
-    // Handle file uploads
-    const baseUrl = process.env.API_BASE_URL || 'http://localhost:3020';
     console.log('[Registration Info Service] Processing files:', {
       hasFiles: !!files,
-      company_brief_profile: files?.company_brief_profile?.[0]?.filename,
-      turnover_document: files?.turnover_document?.[0]?.filename,
-      sez_document: files?.sez_document?.[0]?.filename || files?.sez_input?.[0]?.filename,
+      company_brief_profile: files?.company_brief_profile?.[0]?.originalname,
+      turnover_document: files?.turnover_document?.[0]?.originalname,
+      sez_document:
+        files?.sez_document?.[0]?.originalname || files?.sez_input?.[0]?.originalname,
     });
 
     if (files) {
-      // Handle Company Brief Profile
       const briefProfileFile = files.company_brief_profile?.[0] || files.brief_profile?.[0];
       if (briefProfileFile) {
-        const relativePath = `uploads/registration/${projectId}/${briefProfileFile.filename}`;
-        const fullUrl = `${baseUrl}/${relativePath}`;
-        normalizedData.company_brief_profile_url = fullUrl;
+        normalizedData.company_brief_profile_url = await this.persistUpload(
+          briefProfileFile,
+          `registration/${projectId}`,
+        );
         normalizedData.company_brief_profile_filename = briefProfileFile.originalname;
-        console.log('[Registration Info Service] Saved Company Brief Profile:', {
-          url: fullUrl,
-          filename: briefProfileFile.originalname,
-          savedFilename: briefProfileFile.filename,
-        });
       }
 
-      // Handle Turnover Document
       const turnoverFile = files.turnover_document?.[0] || files.turnover?.[0];
       if (turnoverFile) {
-        const relativePath = `uploads/registration/${projectId}/${turnoverFile.filename}`;
-        const fullUrl = `${baseUrl}/${relativePath}`;
-        normalizedData.turnover_document_url = fullUrl;
+        normalizedData.turnover_document_url = await this.persistUpload(
+          turnoverFile,
+          `registration/${projectId}`,
+        );
         normalizedData.turnover_document_filename = turnoverFile.originalname;
-        console.log('[Registration Info Service] Saved Turnover Document:', {
-          url: fullUrl,
-          filename: turnoverFile.originalname,
-          savedFilename: turnoverFile.filename,
-        });
       }
 
-      // Handle SEZ Document (PDF only enforced by controller filter)
       const sezFile = files.sez_document?.[0] || files.sez_input?.[0];
       if (sezFile) {
-        const relativePath = `uploads/registration/${projectId}/${sezFile.filename}`;
-        const fullUrl = `${baseUrl}/${relativePath}`;
-        normalizedData.sez_document_url = fullUrl;
+        normalizedData.sez_document_url = await this.persistUpload(
+          sezFile,
+          `registration/${projectId}`,
+        );
         normalizedData.sez_document_filename = sezFile.originalname;
-        console.log('[Registration Info Service] Saved SEZ Document:', {
-          url: fullUrl,
-          filename: sezFile.originalname,
-          savedFilename: sezFile.filename,
-        });
       }
-    } else {
-      console.log('[Registration Info Service] No files received');
     }
+
+    this.applyS3RegistrationFileFields(normalizedData);
 
     // Store raw form data under registration_info
     project.registration_info = {
@@ -792,7 +871,8 @@ export class CompanyProjectsService {
       // Non-fatal: registration info was already saved
     }
 
-    // Build response: workflow snapshot for company UI + optional file URLs
+    const baseUrl = (process.env.API_BASE_URL || 'http://localhost:3020').replace(/\/$/, '');
+
     const response: any = {
       status: 'success',
       message: 'Registration info saved successfully',
@@ -805,26 +885,29 @@ export class CompanyProjectsService {
     };
 
     if (normalizedData.company_brief_profile_url) {
-      response.data.company_brief_profile = {
-        url: normalizedData.company_brief_profile_url,
-        filename: normalizedData.company_brief_profile_filename,
-        downloadUrl: `${baseUrl}/api/company/projects/${projectId}/registration-files/company-brief-profile`,
-      };
+      response.data.company_brief_profile = await this.registrationFileView(
+        normalizedData.company_brief_profile_url,
+        normalizedData.company_brief_profile_filename || 'company_brief_profile',
+        `/api/company/projects/${projectId}/registration-files/company-brief-profile`,
+        baseUrl,
+      );
     }
 
     if (normalizedData.turnover_document_url) {
-      response.data.turnover_document = {
-        url: normalizedData.turnover_document_url,
-        filename: normalizedData.turnover_document_filename,
-        downloadUrl: `${baseUrl}/api/company/projects/${projectId}/registration-files/turnover-document`,
-      };
+      response.data.turnover_document = await this.registrationFileView(
+        normalizedData.turnover_document_url,
+        normalizedData.turnover_document_filename || 'turnover_document',
+        `/api/company/projects/${projectId}/registration-files/turnover-document`,
+        baseUrl,
+      );
     }
     if (normalizedData.sez_document_url) {
-      response.data.sez_document = {
-        url: normalizedData.sez_document_url,
-        filename: normalizedData.sez_document_filename,
-        downloadUrl: `${baseUrl}/api/company/projects/${projectId}/registration-files/sez-document`,
-      };
+      response.data.sez_document = await this.registrationFileView(
+        normalizedData.sez_document_url,
+        normalizedData.sez_document_filename || 'sez_document.pdf',
+        `/api/company/projects/${projectId}/registration-files/sez-document`,
+        baseUrl,
+      );
     }
 
     return response;
@@ -897,30 +980,33 @@ export class CompanyProjectsService {
     
     // Add file URLs if they exist (for viewing/downloading)
     if (registrationInfo.company_brief_profile_url) {
-      responseData.company_brief_profile = {
-        url: registrationInfo.company_brief_profile_url,
-        filename: registrationInfo.company_brief_profile_filename || 'company_brief_profile',
-        downloadUrl: `${baseUrl}/api/company/projects/${registrationFilesProjectId}/registration-files/company-brief-profile`,
-      };
+      responseData.company_brief_profile = await this.registrationFileView(
+        registrationInfo.company_brief_profile_url,
+        registrationInfo.company_brief_profile_filename || 'company_brief_profile',
+        `/api/company/projects/${registrationFilesProjectId}/registration-files/company-brief-profile`,
+        baseUrl,
+      );
     } else {
       responseData.company_brief_profile = null;
     }
-    
+
     if (registrationInfo.turnover_document_url) {
-      responseData.turnover_document = {
-        url: registrationInfo.turnover_document_url,
-        filename: registrationInfo.turnover_document_filename || 'turnover_document',
-        downloadUrl: `${baseUrl}/api/company/projects/${registrationFilesProjectId}/registration-files/turnover-document`,
-      };
+      responseData.turnover_document = await this.registrationFileView(
+        registrationInfo.turnover_document_url,
+        registrationInfo.turnover_document_filename || 'turnover_document',
+        `/api/company/projects/${registrationFilesProjectId}/registration-files/turnover-document`,
+        baseUrl,
+      );
     } else {
       responseData.turnover_document = null;
     }
     if (registrationInfo.sez_document_url) {
-      responseData.sez_document = {
-        url: registrationInfo.sez_document_url,
-        filename: registrationInfo.sez_document_filename || 'sez_document.pdf',
-        downloadUrl: `${baseUrl}/api/company/projects/${registrationFilesProjectId}/registration-files/sez-document`,
-      };
+      responseData.sez_document = await this.registrationFileView(
+        registrationInfo.sez_document_url,
+        registrationInfo.sez_document_filename || 'sez_document.pdf',
+        `/api/company/projects/${registrationFilesProjectId}/registration-files/sez-document`,
+        baseUrl,
+      );
     } else {
       responseData.sez_document = null;
     }
@@ -2108,10 +2194,9 @@ export class CompanyProjectsService {
       String((launchTrainingResourceDoc as any).document_url || '').trim()
     );
     /** Align with `GET /api/admin/projects/:id/launch-training-program` (`buildLaunchTrainingProgramData`). */
-    const ltProgramSnapshot = this.buildLaunchTrainingProgramData(
+    const ltProgramSnapshot = await this.buildLaunchTrainingProgramData(
       project as any,
       String(projectId),
-      baseUrl,
       hasCoordinatorAssigned,
     );
     const launchTrainingDoneFromLaunchTrainingGet =
@@ -2881,13 +2966,9 @@ export class CompanyProjectsService {
       });
     }
 
-    const baseUrl = process.env.API_BASE_URL || 'http://localhost:3020';
-    // Use Laravel-compatible path: uploads/company/{projectId}/
-    const relativePath = `uploads/company/${projectId}/${file.filename}`;
-    const fullUrl = `${baseUrl}/${relativePath}`;
+    const storageValue = await this.persistUpload(file, `company/${projectId}`);
 
-    // Save proposal document path (pending company approval)
-    project.proposal_document = fullUrl;
+    project.proposal_document = storageValue;
     (project as any).proposal_status = 0;
     (project as any).proposal_remarks = null;
     (project as any).proposal_status_updated_at = new Date();
@@ -2959,9 +3040,11 @@ export class CompanyProjectsService {
     (project as any).next_activities_id = Math.min(24, Math.max(3, currentNext));
     await project.save();
 
+    const documentUrl = await this.resolveStoredDownloadUrl(storageValue);
+
     console.log('[Proposal Document] Uploaded successfully:', {
       projectId: projectId.toString(),
-      documentUrl: fullUrl,
+      storageValue,
       next_activities_id: project.next_activities_id,
     });
 
@@ -2969,7 +3052,7 @@ export class CompanyProjectsService {
       status: 'success',
       message: 'Proposal Document uploaded successfully',
       data: {
-        document_url: fullUrl,
+        document_url: documentUrl || storageValue,
         document_filename: file.originalname,
         project_id: projectId,
         proposal_status: (project as any).proposal_status ?? 0,
@@ -3220,13 +3303,11 @@ export class CompanyProjectsService {
     };
   }
 
-  /**
-   * Absolute path to on-disk proposal file for company (GET …/proposal-document/file stream).
-   */
-  async getProposalDocumentLocalFilePathOrThrow(
+  /** Signed/public URL for proposal PDF (GET …/proposal-document/file redirects here). */
+  async getProposalDocumentDownloadUrlOrThrow(
     companyId: string,
     projectId: string,
-  ): Promise<{ fullPath: string; filename: string; ext: string }> {
+  ): Promise<{ url: string; filename: string }> {
     const project = await this.projectModel.findOne({
       _id: projectId,
       company_id: companyId,
@@ -3235,19 +3316,15 @@ export class CompanyProjectsService {
       throw new NotFoundException({ status: 'error', message: 'Proposal document not found' });
     }
     const pathRaw = String((project as any).proposal_document).trim();
-    const relativePath = pathRaw.startsWith('http')
-      ? pathRaw.replace(/^https?:\/\/[^/]+/, '').replace(/^\//, '')
-      : pathRaw.replace(/^\//, '');
-    const fullPath = join(process.cwd(), relativePath);
-    if (!fs.existsSync(fullPath)) {
+    const url = await this.resolveStoredDownloadUrl(pathRaw);
+    if (!url) {
       throw new NotFoundException({
         status: 'error',
-        message: 'Proposal file not found on server',
+        message: 'Proposal file not found',
       });
     }
     const filename = pathRaw.split('/').pop() || 'proposal.pdf';
-    const ext = extname(filename).toLowerCase() || '.pdf';
-    return { fullPath, filename, ext };
+    return { url, filename };
   }
 
   /**
@@ -3273,15 +3350,13 @@ export class CompanyProjectsService {
       });
     }
 
-    const baseUrl = process.env.API_BASE_URL || 'http://localhost:3020';
-    const relativePath = `uploads/resources/${projectId}/${file.filename}`;
-    const fullUrl = `${baseUrl}/${relativePath}`;
+    const storageValue = await this.persistUpload(file, `resources/${projectId}`);
+    const documentUrl = await this.resolveStoredDownloadUrl(storageValue);
 
-    // Create resource document entry
     const resourceDoc = new this.companyResourceDocumentModel({
       company_id: companyId,
       project_id: projectId,
-      document_url: fullUrl,
+      document_url: storageValue,
       document_filename: file.originalname,
       document_title: title || file.originalname,
       document_type: documentType || 'general',
@@ -3334,7 +3409,7 @@ export class CompanyProjectsService {
 
     console.log('[Resource Document] Uploaded successfully:', {
       projectId: projectId.toString(),
-      documentUrl: fullUrl,
+      storageValue,
       documentTitle: title,
     });
 
@@ -3343,7 +3418,7 @@ export class CompanyProjectsService {
       message: 'Resource document uploaded successfully',
       data: {
         id: resourceDoc._id.toString(),
-        document_url: fullUrl,
+        document_url: documentUrl || storageValue,
         document_filename: file.originalname,
         document_title: title || file.originalname,
         document_type: documentType || 'general',
@@ -3831,12 +3906,11 @@ export class CompanyProjectsService {
   /**
    * Shared JSON for GET launch-and-training (company) and GET launch-training-program (admin dashboard).
    */
-  private buildLaunchTrainingProgramData(
+  private async buildLaunchTrainingProgramData(
     projectAny: any,
     projectId: string,
-    baseUrl: string,
     coordinator_assigned: boolean,
-  ): {
+  ): Promise<{
     project_id: string;
     coordinator_assigned: boolean;
     section_available: boolean;
@@ -3859,9 +3933,11 @@ export class CompanyProjectsService {
       document_filename: string | null;
       session_date: string | null;
     } | null;
-  } {
+  }> {
     const merged = this.mergeLaunchTrainingSessionsFromDb(projectAny);
-    const sessions = merged.map((s) => this.formatLaunchTrainingSessionRow(s, baseUrl));
+    const sessions = await Promise.all(
+      merged.map((s) => this.formatLaunchTrainingSessionRow(s)),
+    );
     const first = sessions[0];
     const maxSessions = CompanyProjectsService.LAUNCH_TRAINING_MAX_SESSIONS;
     const toIso = (d: any) =>
@@ -3875,9 +3951,8 @@ export class CompanyProjectsService {
       : '';
     const legacy_single = legacyPath
       ? {
-          document_url: legacyPath.startsWith('http')
-            ? legacyPath
-            : `${baseUrl}/${legacyPath.replace(/^\//, '')}`,
+          document_url:
+            (await this.resolveStoredDownloadUrl(legacyPath)) || legacyPath,
           document_filename:
             (legacyPath.split('/').pop() || null) as string | null,
           session_date: toIso(projectAny.launch_training_report_date),
@@ -3898,7 +3973,7 @@ export class CompanyProjectsService {
     };
   }
 
-  private formatLaunchTrainingSessionRow(
+  private async formatLaunchTrainingSessionRow(
     s: {
       session_index: number;
       document_path: string;
@@ -3907,21 +3982,16 @@ export class CompanyProjectsService {
       uploaded_at?: Date;
       from_legacy?: boolean;
     },
-    baseUrl: string,
-  ): {
+  ): Promise<{
     session_index: number;
     document_url: string | null;
     document_filename: string | null;
     session_date: string | null;
     uploaded_at: string | null;
     from_legacy?: boolean;
-  } {
+  }> {
     const path = s.document_path;
-    const documentUrl = path
-      ? path.startsWith('http')
-        ? path
-        : `${baseUrl}/${String(path).replace(/^\//, '')}`
-      : null;
+    const documentUrl = path ? await this.resolveStoredDownloadUrl(path) : null;
     const toIso = (d: any) =>
       d
         ? typeof d === 'string'
@@ -3990,10 +4060,9 @@ export class CompanyProjectsService {
     const baseUrl = process.env.API_BASE_URL || 'http://localhost:3020';
     const coord = await this.findCompanyCoordinatorAssignmentLean(companyId, projectId, projectAny);
     const coordinator_assigned = !!(coord as any)?.coordinator_id;
-    const data = this.buildLaunchTrainingProgramData(
+    const data = await this.buildLaunchTrainingProgramData(
       projectAny,
       projectId,
-      baseUrl,
       coordinator_assigned,
     );
     return {
@@ -4039,10 +4108,9 @@ export class CompanyProjectsService {
       projectAny,
     );
     const coordinator_assigned = !!(coord as any)?.coordinator_id;
-    const data = this.buildLaunchTrainingProgramData(
+    const data = await this.buildLaunchTrainingProgramData(
       projectAny,
       resolvedProjectId,
-      baseUrl,
       coordinator_assigned,
     );
     return {
@@ -4101,24 +4169,11 @@ export class CompanyProjectsService {
 
     const baseUrl = process.env.API_BASE_URL || 'http://localhost:3020';
     const companyFolder = String(companyId);
-    let storedFilename: string;
-    let relativePath: string;
-    const buf = (file as Express.Multer.File & { buffer?: Buffer }).buffer;
-    if (buf && Buffer.isBuffer(buf)) {
-      const safeOrig = String(file.originalname || 'document.pdf').replace(/[^a-zA-Z0-9._-]+/g, '_');
-      storedFilename = `${Date.now()}_${Math.round(Math.random() * 1e9)}_${safeOrig}`;
-      const dir = join(process.cwd(), 'uploads', 'companyproject', 'launchAndTraining', companyFolder);
-      if (!fs.existsSync(dir)) {
-        fs.mkdirSync(dir, { recursive: true });
-      }
-      const abs = join(dir, storedFilename);
-      await fs.promises.writeFile(abs, buf);
-      relativePath = `uploads/companyproject/launchAndTraining/${companyFolder}/${storedFilename}`;
-    } else {
-      storedFilename = file.filename;
-      relativePath = `uploads/companyproject/launchAndTraining/${companyFolder}/${storedFilename}`;
-    }
-    const fullUrl = `${baseUrl}/${relativePath}`;
+    const storageValue = await this.persistUpload(
+      file,
+      `companyproject/launchAndTraining/${companyFolder}`,
+    );
+    const documentUrl = await this.resolveStoredDownloadUrl(storageValue);
 
     const pAny = project as any;
     let sessions: Array<{
@@ -4152,7 +4207,7 @@ export class CompanyProjectsService {
     sessions = sessions.filter((s) => s.session_index !== sessionIndex);
     sessions.push({
       session_index: sessionIndex,
-      document_path: relativePath,
+      document_path: storageValue,
       document_filename: file.originalname,
       session_date: reportDate,
       uploaded_at: new Date(),
@@ -4198,14 +4253,16 @@ export class CompanyProjectsService {
       .catch((err) => console.error('Launch & training email failed:', err));
 
     const merged = this.mergeLaunchTrainingSessionsFromDb(pAny);
-    const apiSessions = merged.map((s) => this.formatLaunchTrainingSessionRow(s, baseUrl));
+    const apiSessions = await Promise.all(
+      merged.map((s) => this.formatLaunchTrainingSessionRow(s)),
+    );
 
     return {
       status: 'success',
       message: 'Launch & Training session uploaded successfully',
       data: {
         session_index: sessionIndex,
-        document_url: fullUrl,
+        document_url: documentUrl || storageValue,
         document_filename: file.originalname,
         session_date: reportDate?.toISOString?.() ?? dto.session_date ?? null,
         sessions: apiSessions,
@@ -4261,18 +4318,11 @@ export class CompanyProjectsService {
     const group = sectorDoc?.group_name ?? '';
     const sectorName = sectorDoc?.name ?? '';
 
-    const baseUrl = process.env.API_BASE_URL || 'http://localhost:3020';
-
-    const toUrl = (path: string | undefined): string | null => {
-      if (!path) return null;
-      return path.startsWith('http') ? path : `${baseUrl}/${path.replace(/^\//, '')}`;
-    };
-
     const projectAny = project as any;
 
     const ltMerged = this.mergeLaunchTrainingSessionsFromDb(projectAny);
-    const launchTrainingSessionsFormatted = ltMerged.map((s) =>
-      this.formatLaunchTrainingSessionRow(s, baseUrl),
+    const launchTrainingSessionsFormatted = await Promise.all(
+      ltMerged.map((s) => this.formatLaunchTrainingSessionRow(s)),
     );
 
     const documents: {
@@ -4306,26 +4356,35 @@ export class CompanyProjectsService {
         updated_at?: string;
       }>;
     } = {
-      proposal_document: toUrl(projectAny.proposal_document) ?? null,
-      work_order_document: (workOrder as any)?.wo_doc ? toUrl((workOrder as any).wo_doc) : null,
-      launch_training_document: toUrl(projectAny.launch_training_document) ?? null,
+      proposal_document: await this.resolveStoredDownloadUrl(projectAny.proposal_document),
+      work_order_document: (workOrder as any)?.wo_doc
+        ? await this.resolveStoredDownloadUrl((workOrder as any).wo_doc)
+        : null,
+      launch_training_document: await this.resolveStoredDownloadUrl(
+        projectAny.launch_training_document,
+      ),
       launch_training_report_date: projectAny.launch_training_report_date
         ? (typeof projectAny.launch_training_report_date === 'string'
             ? projectAny.launch_training_report_date
             : (projectAny.launch_training_report_date as Date)?.toISOString?.()) ?? null
         : null,
       launch_training_sessions: launchTrainingSessionsFormatted,
-      hand_holding_document: toUrl(projectAny.hand_holding_document) ?? null,
-      hand_holding_document2: toUrl(projectAny.hand_holding_document2) ?? null,
-      hand_holding_document3: toUrl(projectAny.hand_holding_document3) ?? null,
+      hand_holding_document: await this.resolveStoredDownloadUrl(
+        projectAny.hand_holding_document,
+      ),
+      hand_holding_document2: await this.resolveStoredDownloadUrl(
+        projectAny.hand_holding_document2,
+      ),
+      hand_holding_document3: await this.resolveStoredDownloadUrl(
+        projectAny.hand_holding_document3,
+      ),
       assessment_submittals: [],
     };
 
     for (const doc of resourceDocs as any[]) {
       if (!doc.document_url) continue;
-      const docUrl = doc.document_url.startsWith('http')
-        ? doc.document_url
-        : `${baseUrl}/${doc.document_url.replace(/^\//, '')}`;
+      const docUrl = await this.resolveStoredDownloadUrl(doc.document_url);
+      if (!docUrl) continue;
       const docType = doc.document_type || 'general';
 
       if (docType === 'launch_training' && !documents.launch_training_document) {
@@ -4802,8 +4861,11 @@ export class CompanyProjectsService {
       });
     }
 
-    const relativePath = `uploads/company/${companyId}/invoices/${file.filename}`;
-    invoice.invoice_document = relativePath;
+    const storageValue = await this.persistUpload(
+      file,
+      `company/${companyId}/invoices`,
+    );
+    invoice.invoice_document = storageValue;
     invoice.invoice_document_filename = file.originalname;
     await invoice.save();
 
@@ -4861,8 +4923,7 @@ export class CompanyProjectsService {
       this.mailService.sendInvoiceRaisedEmail(company.email, company.name || 'Company', invoiceLabel, projectCode).catch((e) => console.error('Invoice email to company failed:', e));
     }
 
-    const baseUrl = process.env.API_BASE_URL || 'http://localhost:3020';
-    const documentUrl = relativePath.startsWith('http') ? relativePath : `${baseUrl}/${relativePath.replace(/^\//, '')}`;
+    const documentUrl = await this.resolveStoredDownloadUrl(storageValue);
 
     return {
       status: 'success',
@@ -4870,7 +4931,7 @@ export class CompanyProjectsService {
       data: {
         invoice_id: invoice._id.toString(),
         payment_for: invoice.payment_for,
-        invoice_document: documentUrl,
+        invoice_document: documentUrl || storageValue,
         invoice_document_filename: invoice.invoice_document_filename,
       },
     };
@@ -4878,7 +4939,7 @@ export class CompanyProjectsService {
 
   /**
    * Submit payment for an invoice (payment type, transaction ID, supporting document).
-   * File upload to uploads/company/{company_id}/; updates CompanyInvoice and optionally activity log.
+   * Offline payment supporting document → S3; updates CompanyInvoice and activity log.
    */
   async submitPayment(
     companyId: string,
@@ -4919,8 +4980,8 @@ export class CompanyProjectsService {
       }
     }
 
-    const relativePath = file
-      ? `uploads/company/${companyId}/${file.filename}`
+    const offlineDocStorage = file
+      ? await this.persistUpload(file, `company/${companyId}/payments`)
       : undefined;
 
     // Preserve previous submitted payment details as reupload history when user submits again.
@@ -4945,8 +5006,8 @@ export class CompanyProjectsService {
 
     invoice.payment_type = dto.payment_type;
     invoice.trans_id = dto.payment_type === 'Offline' ? dto.trans_id?.trim() : undefined;
-    if (relativePath) {
-      invoice.offline_tran_doc = relativePath;
+    if (offlineDocStorage) {
+      invoice.offline_tran_doc = offlineDocStorage;
       invoice.offline_tran_doc_filename = file!.originalname;
     }
     invoice.payment_status = 1; // Mark as paid/submitted
@@ -5317,18 +5378,14 @@ export class CompanyProjectsService {
       })
       .sort({ createdAt: -1 });
 
-    const baseUrl = process.env.API_BASE_URL || 'http://localhost:3020';
-    // Use Laravel-compatible path: uploads/companyproject/{projectId}/
-    const relativePath = `uploads/companyproject/${projectId}/${file.filename}`;
-    const fullUrl = `${baseUrl}/${relativePath}`;
+    const storageValue = await this.persistUpload(file, `companyproject/${projectId}`);
+    const documentUrl = await this.resolveStoredDownloadUrl(storageValue);
 
-    // Create or update work order document
     let workOrder;
     const isReUpload = existingWorkOrder && existingWorkOrder.wo_status === 2;
 
     if (existingWorkOrder && isReUpload) {
-      // Update existing work order (re-upload after rejection)
-      existingWorkOrder.wo_doc = relativePath;
+      existingWorkOrder.wo_doc = storageValue;
       existingWorkOrder.wo_status = 0; // Reset to Under Review
       existingWorkOrder.wo_remarks = null; // Clear previous remarks
       (existingWorkOrder as any).wo_po_number = undefined;
@@ -5342,8 +5399,8 @@ export class CompanyProjectsService {
       workOrder = await this.companyWorkOrderModel.create({
         company_id: companyId,
         project_id: projectId,
-        wo_doc: relativePath,
-        wo_status: 0, // Under Review
+        wo_doc: storageValue,
+        wo_status: 0,
         wo_remarks: null,
       });
     }
@@ -5374,7 +5431,7 @@ export class CompanyProjectsService {
 
     console.log('[Work Order Upload] Document uploaded successfully:', {
       projectId: projectId.toString(),
-      documentUrl: fullUrl,
+      storageValue,
       isReUpload,
       next_activities_id: project.next_activities_id,
     });
@@ -5399,10 +5456,10 @@ export class CompanyProjectsService {
         ? 'Work Order Document re-uploaded successfully' 
         : 'Work Order Document uploaded successfully',
       data: {
-        document_url: fullUrl,
+        document_url: documentUrl || storageValue,
         document_filename: file.originalname,
         project_id: projectId,
-        wo_status: 0, // Under Review
+        wo_status: 0,
         next_activities_id: project.next_activities_id,
       },
     };
@@ -6093,9 +6150,12 @@ export class CompanyProjectsService {
     // Handle contract document upload if provided
     let contractDocumentPath = null;
     if (contractDocument) {
-      const baseUrl = process.env.API_BASE_URL || 'http://localhost:3020';
-      const relativePath = `uploads/facilitator-contracts/${projectId}/${contractDocument.filename}`;
-      contractDocumentPath = `${baseUrl}/${relativePath}`;
+      const storageValue = await this.persistUpload(
+        contractDocument,
+        `facilitator-contracts/${projectId}`,
+      );
+      contractDocumentPath =
+        (await this.resolveStoredDownloadUrl(storageValue)) || storageValue;
       console.log('[Assign Facilitator] Contract document saved:', contractDocumentPath);
     }
 

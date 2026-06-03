@@ -1,5 +1,6 @@
 import { Module } from '@nestjs/common';
 import { MongooseModule } from '@nestjs/mongoose';
+import { S3Module } from '../../s3/s3.module';
 import { AssessorManagementController } from './assessor-management.controller';
 import { AssessorManagementService } from './assessor-management.service';
 import { Assessor, AssessorSchema } from '../../company/schemas/assessor.schema';
@@ -8,6 +9,7 @@ import { Industry, IndustrySchema } from '../../company/schemas/industry.schema'
 
 @Module({
   imports: [
+    S3Module,
     MongooseModule.forFeature([
       { name: Assessor.name, schema: AssessorSchema },
       { name: State.name, schema: StateSchema },

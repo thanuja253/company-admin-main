@@ -115,6 +115,7 @@ async function bootstrap() {
     next();
   });
 
+  /** Legacy local files only (pre-S3 rows). New uploads are stored in S3 (`s3:…`). */
   app.useStaticAssets(join(__dirname, '..', 'uploads'), {
     prefix: '/uploads/',
   });
